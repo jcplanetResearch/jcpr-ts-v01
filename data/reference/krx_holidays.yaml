@@ -1,0 +1,94 @@
+# ============================================================
+# KRX 휴장일 캘린더 (KRX Holiday Calendar)
+# 파일: data/reference/krx_holidays.yaml
+# ============================================================
+#
+# 본 파일은 KRX 휴장일과 시장 시간 정의를 보관한다.
+# src/data/calendar.py 가 본 파일을 로드하여 사용한다.
+#
+# ⚠️ 사용자 갱신 필요 (User-update required):
+#   1. 휴장일은 매년 한국거래소가 발표한다 ([verify] every year).
+#   2. 발표 이후 본 파일을 갱신하고 last_updated 와 metadata 를 수정한다.
+#   3. 임시공휴일 등 추가 발표 시 즉시 갱신.
+#
+# ⚠️ 검증 표기 ([verify]):
+#   본 파일의 휴장일은 일반적으로 알려진 항목만 포함한다.
+#   사용자께서 KRX 공식 공시로 정확한 목록을 확인·보완하셔야 한다.
+#
+# 관련 문서:
+#   - docs/00_target_operating_model.md
+#   - configs/risk_limits.example.yaml (open_close_guard 와 연동)
+# ============================================================
+
+schema_version: "1.0"
+exchange: "KRX"
+last_updated: "2026-05-04"
+metadata:
+  source: "한국거래소 공시 ([verify] with official KRX announcement)"
+  notes: "임시공휴일 발표 시 즉시 추가. 매년 12월 익년도 일정 업데이트."
+
+# ============================================================
+# 시장 시간 정의 (KST 기준)
+# ============================================================
+# 본 시스템(jcpr-ts-v01) Phase 1 은 정규장(regular session)만 거래 대상.
+# 시간외 단일가, 동시호가 등은 추후 확장 시 별도 정의.
+market_hours:
+  timezone: "Asia/Seoul"
+  regular_session:
+    start: "09:00"           # 정규장 시작
+    end:   "15:30"           # 정규장 종료
+  # Pre-open / near-close 영역은 calendar.py 의 인자(pre_open_minutes,
+  # near_close_minutes)로 동적 설정. 본 파일에 박지 않음.
+
+# ============================================================
+# 휴장일 (Holidays) — KST 날짜 기준
+# ============================================================
+# 형식: 연도 → 날짜 목록.
+# 토요일·일요일은 자동 휴장으로 처리 (yaml 에 명시 불필요).
+# 본 목록은 일반적 휴장일만 포함하며 사용자 검증 필요.
+holidays:
+
+  "2026":
+    # ---- 1월 ----
+    - { date: "2026-01-01", name: "신정 (New Year's Day)" }
+    # ---- 2월 (설날 — 음력 기반, 매년 다름; [verify] KRX 공시) ----
+    - { date: "2026-02-16", name: "설날 연휴 (Lunar New Year Eve)" }
+    - { date: "2026-02-17", name: "설날 (Lunar New Year)" }
+    - { date: "2026-02-18", name: "설날 연휴 (Lunar New Year +1)" }
+    # ---- 3월 ----
+    - { date: "2026-03-02", name: "삼일절 대체 (Independence Movement Day - substitute, 2026-03-01 is Sunday)" }
+    # ---- 5월 ----
+    - { date: "2026-05-01", name: "근로자의 날 (Labor Day)" }
+    - { date: "2026-05-05", name: "어린이날 (Children's Day)" }
+    - { date: "2026-05-25", name: "부처님 오신 날 ([verify] Buddha's Birthday — date depends on lunar calendar)" }
+    # ---- 6월 ----
+    - { date: "2026-06-03", name: "지방선거 (Local Election — [verify] if applicable)" }
+    - { date: "2026-06-06", name: "현충일 (Memorial Day)" }
+    # ---- 8월 ----
+    - { date: "2026-08-17", name: "광복절 대체 (Liberation Day - substitute, 2026-08-15 is Saturday)" }
+    # ---- 9월 (추석 — 음력 기반; [verify] KRX 공시) ----
+    - { date: "2026-09-24", name: "추석 연휴 (Chuseok Eve)" }
+    - { date: "2026-09-25", name: "추석 (Chuseok)" }
+    - { date: "2026-09-28", name: "추석 대체 (Chuseok substitute, 2026-09-26 is Saturday)" }
+    # ---- 10월 ----
+    - { date: "2026-10-03", name: "개천절 (National Foundation Day — Saturday)" }
+    - { date: "2026-10-05", name: "개천절 대체 (National Foundation Day - substitute)" }
+    - { date: "2026-10-09", name: "한글날 (Hangul Day)" }
+    # ---- 12월 ----
+    - { date: "2026-12-25", name: "성탄절 (Christmas)" }
+    - { date: "2026-12-31", name: "연말 휴장 (Year-End Closure)" }
+
+  # 2027 년 이후는 KRX 공식 발표 후 추가
+  # "2027":
+  #   - { date: "2027-01-01", name: "신정" }
+  #   ...
+
+# ============================================================
+# 사용자 인지 메모 (Operator Notes)
+# ============================================================
+notes:
+  - "본 파일은 KRX 공식 공시 기반으로 사용자가 매년 갱신해야 한다."
+  - "임시공휴일·재해 등으로 갑작스러운 휴장 발생 시 즉시 갱신."
+  - "갱신 후 last_updated 일자와 metadata 를 함께 수정."
+  - "src/data/calendar.py 는 본 파일이 누락되거나 해당 연도 데이터가 없으면"
+  - "is_open 을 False 로 반환한다 (fail-closed 원칙)."
