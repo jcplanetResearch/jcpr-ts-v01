@@ -59,6 +59,20 @@ class KillSwitchMonitor:
     # ------------------------------------------------------------
     # 즉시 검사 (Hot-path)
     # ------------------------------------------------------------
+    def file_present(self) -> bool:
+        """Kill switch 파일이 현재 실제로 존재하는가?
+
+        StopState 의 정지 여부와 무관하게, *파일의 실제 존재 여부* 만 반환.
+        파일 시스템 검사가 실패하면 fail-safe 로 True (정지로 간주).
+
+        본 메서드는 부수효과 없음 (request_stop 호출 안 함).
+        check_kill_switch 검사 함수에서 사유 분류를 위해 사용.
+        """
+        try:
+            return self._path.exists()
+        except OSError:
+            return True  # fail-safe
+
     def check_now(self) -> bool:
         """즉시 1회 검사.
 
