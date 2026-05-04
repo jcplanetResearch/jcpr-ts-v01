@@ -1,1 +1,44 @@
 .DS_Store
+# === 보안 핵심 (CRITICAL — Security) ===
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+*.p12
+credentials.json
+configs/live_limited.yaml          # 실제 라이브 설정 (예제만 커밋)
+configs/capacity.local.yaml        # 실제 자본 설정
+runtime/                            # 킬 스위치, 런타임 상태
+
+# === 데이터·DB (Data & DB) ===
+data/market/
+data/audit/
+*.sqlite
+*.db
+*.duckdb
+
+# === 로그 (Logs) ===
+logs/
+*.log
+
+# === 보고서 (Reports — 잠재 PII/잔고 포함) ===
+reports/output/
+*.session.json
+
+# === 파이썬 표준 (Python Standard) ===
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# === IDE / OS ===
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
