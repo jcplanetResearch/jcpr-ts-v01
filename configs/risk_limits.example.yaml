@@ -1,0 +1,358 @@
+# ============================================================
+# jcpr-ts-v01 — Risk Limits Configuration Template
+# 파일: configs/risk_limits.example.yaml
+# 리스크 한도 설정 템플릿 (Risk Limits Template)
+# ============================================================
+#
+# 사용법 (Usage):
+#   1. 본 파일을 risk_limits.local.yaml 로 복사
+#        cp configs/risk_limits.example.yaml configs/risk_limits.local.yaml
+#   2. 모든 예시값(illustrative values)을 실제 값으로 교체
+#   3. risk_limits.local.yaml 은 .gitignore 에 의해 자동 제외됨
+#
+# 보안 원칙 (Security principle):
+#   본 .example 파일에는 실제 자본·계좌 정보가 포함되지 않는다.
+#   금액은 모두 KRW 기준 예시값이며, 실제 운영값은 .local 파일에 둔다.
+#
+# 역할 분리 (Role separation):
+#   - capacity.yaml      = 자본(capital) 관점의 절대/비율 상한
+#   - risk_limits.yaml   = 리스크·동작(risk/behavior) 관점의 상한 + 사전 게이트 동작
+#   사전 리스크 게이트(Task 19 src/risk/risk_gate.py) 는 두 파일을 함께 평가한다.
+#
+# 관련 문서 (Related docs):
+#   - docs/00_target_operating_model.md  (목표 운영 모델 — §6 비상 정지)
+#   - docs/09_production_rollout.md      (사다리 / 회귀 기준)
+#   - configs/capacity.example.yaml      (자본 한도 — Task 5)
+# ============================================================
+
+
+# ============================================================
+# 1. 스키마 / 프로파일 (Schema & Profile)
+# ============================================================
+schema_version: "1.0"
+profile_name: "example"           # local 사용 시 "limited_tier1" 등으로 변경
+
+
+# ============================================================
+# 2. 사다리 단계 참조 (Ladder Reference — must match capacity.yaml)
+# ============================================================
+# 본 파일의 ladder.current_stage 는 capacity.local.yaml 과 정확히 일치해야 한다.
+# 일치하지 않으면 세션은 시작되지 않는다 (validation §11 참조).
+ladder_reference:
+  current_stage: "L0_paper"       # capacity.local.yaml 의 ladder.current_stage 와 동일해야 함
+  must_match_capacity: true       # 검증 강제
+
+
+# ============================================================
+# 3. 손실 한도 (Loss Limits)
+# ============================================================
+# 도달 시 동작은 명시적으로 정의되며, 정지(halt)는 항상 신규 주문보다 우선.
+# 인간 검토 없이 자동 재개되는 경우는 없다.
+loss_limits:
+
+  # 3.1 일일 손실 한도 (Daily loss cap)
+  daily_loss_cap:
+    amount: 200000                # 예시: 20만 원 (illustrative only)
+    measure: "realized_plus_unrealized"   # realized_only | realized_plus_unrealized
+    action: "halt_session"        # halt_session | halt_new_orders
+    require_human_review_to_resume: true
+    note: "도달 시 당일 세션 정지. 익일 재개에는 인간 검토 필요."
+
+  # 3.2 세션 손실 한도 (Session loss cap — 단일 세션)
+  session_loss_cap:
+    amount: 100000                # 예시: 10만 원
+    measure: "realized_plus_unrealized"
+    action: "halt_new_orders"     # 세션은 유지되나 신규 주문 차단
+    note: "기존 포지션 관리는 가능, 신규 진입만 차단."
+
+  # 3.3 트레일링 드로다운 (Trailing drawdown — 세션 최고점 대비)
+  trailing_drawdown:
+    enabled: true
+    threshold_pct: 5.0            # 세션 최고점 대비 -5% 도달 시
+    measure: "equity_high_water_mark"
+    action: "halt_session"
+    require_human_review_to_resume: true
+
+  # 3.4 단일 포지션 손실 한도 (Per-position loss cap)
+  per_position_loss_cap:
+    amount: 50000                 # 예시: 5만 원
+    action: "force_close"         # force_close | halt_new_orders | alert_only
+    note: "도달 시 해당 포지션 강제 청산 (브로커 가용 시)."
+
+
+# ============================================================
+# 4. 포지션 / 노출 한도 (Position / Exposure Limits)
+# ============================================================
+position_limits:
+
+  # 4.1 동시 보유 포지션 수 (Max concurrent positions)
+  max_concurrent_positions: 5
+
+  # 4.2 동시 미체결 주문 수 (Max concurrent open orders)
+  max_open_orders: 10
+
+  # 4.3 심볼당 추가 진입 한도 (Max adds per symbol)
+  max_adds_per_symbol: 3
+  max_adds_per_symbol_per_session: 5
+
+  # 4.4 단일 주문 수량 한도 (Max quantity per order)
+  # 명목금액(notional) 한도는 capacity.yaml 에서 정의됨.
+  # 여기서는 수량(quantity) 차원에서의 sanity 한도.
+  max_quantity_per_order: 1000
+
+  # 4.5 단일 심볼 일일 회전 한도 (Max turnovers per symbol per day)
+  max_turnovers_per_symbol_per_day: 4   # 같은 심볼 매수→매도→매수→매도 = 2회전
+
+
+# ============================================================
+# 5. 주문 빈도 한도 (Order Frequency Limits)
+# ============================================================
+# capacity.yaml 의 보수 캡(conservative cap)보다 항상 같거나 엄격해야 함.
+order_frequency_limits:
+
+  max_orders_per_minute: 10
+  max_orders_per_5_minutes: 30
+  max_orders_per_hour: 100
+  max_orders_per_session: 200
+
+  # 동일 심볼 연속 주문 쿨다운 (Same-symbol cooldown)
+  same_symbol_cooldown_seconds: 5
+
+  # 한도 초과 시 동작
+  on_breach:
+    action: "halt_new_orders"
+    cool_down_seconds: 300
+    require_human_review_to_resume: true
+
+
+# ============================================================
+# 6. 가격 / 체결 보호 (Price / Execution Guards)
+# ============================================================
+execution_guards:
+
+  # 6.1 슬리피지 허용치 (Slippage tolerance)
+  slippage_tolerance:
+    max_bps: 30                   # 30 bps = 0.30%
+    measure_against: "arrival_price"   # arrival_price | mid | last
+    action_on_breach: "reject_order"
+    note: "주문 발주 시점의 도달 가격(arrival price) 대비 허용 슬리피지."
+
+  # 6.2 가격 sanity 한도 (Price sanity bounds)
+  price_sanity:
+    max_deviation_from_last_pct: 5.0   # 직전가 대비 ±5% 초과 시 거부
+    max_deviation_from_mid_pct: 3.0
+    action_on_breach: "reject_order"
+
+  # 6.3 호가 스프레드 한도 (Bid-ask spread cap)
+  bid_ask_spread_cap:
+    max_bps: 50                   # 50 bps 초과 시 거부
+    action_on_breach: "reject_order"
+
+  # 6.4 호가 가용성 (Quote freshness)
+  quote_freshness:
+    max_age_seconds: 5            # 5초 이상 지난 호가로는 거래 금지
+    action_on_breach: "reject_order"
+
+  # 6.5 거래량 sanity (Volume sanity)
+  volume_sanity:
+    min_avg_daily_volume: 10000   # 평균 일거래량이 이보다 작으면 거래 금지
+    action_on_breach: "reject_order"
+
+
+# ============================================================
+# 7. 중복 / 충돌 방지 (Duplicate / Conflict Guards)
+# ============================================================
+duplicate_conflict_guards:
+
+  # 7.1 미체결 중복 주문 차단
+  no_duplicate_while_pending: true
+  duplicate_definition: "same_symbol_same_side_within_window"
+  duplicate_window_seconds: 30
+
+  # 7.2 자기 매매 방지 (self-cross)
+  self_cross_prevention: true
+
+  # 7.3 체결 후 쿨다운
+  cooldown_after_fill_seconds: 5
+
+  # 7.4 반대 방향 즉시 진입 차단 (Whipsaw guard)
+  no_immediate_reversal: true
+  reversal_cooldown_seconds: 60
+
+
+# ============================================================
+# 8. 변동성 / 시장 상태 가드 (Volatility / Market State Guards)
+# ============================================================
+market_state_guards:
+
+  # 8.1 변동성 폭주 (Volatility surge)
+  volatility_surge:
+    enabled: true
+    measure: "intraday_realized_vol_pct"
+    threshold_pct: 3.0            # 분봉 기준 실현 변동성이 임계치 초과 시
+    action: "halt_new_orders"
+    cool_down_seconds: 300
+
+  # 8.2 거래량 급감 (Volume collapse)
+  volume_collapse:
+    enabled: true
+    pct_of_normal_threshold: 20.0 # 평소 대비 20% 이하로 떨어지면
+    action: "halt_new_orders"
+
+  # 8.3 시장 개·폐장 가드 (Market open/close guard)
+  open_close_guard:
+    avoid_first_minutes: 5        # 개장 후 N분 동안 신규 주문 자제
+    avoid_last_minutes: 5         # 폐장 전 N분 동안 신규 주문 자제
+    action: "reject_order"
+
+  # 8.4 캘린더 상태 (Calendar state — Task 11)
+  require_market_open: true       # 시장 마감/휴장 시 신규 주문 거부
+
+
+# ============================================================
+# 9. 비상 정지 연계 (Emergency Stop Linkage)
+# ============================================================
+# docs/00_target_operating_model.md §6 의 정지 우선 원칙(stop-first) 정합.
+emergency_stop:
+
+  # 정지 입력은 항상 신규 주문보다 우선한다 (prevails).
+  prevails_over_new_orders: true  # 변경 불가 (immutable principle)
+
+  # 9.1 킬 스위치 파일 (Task 31)
+  kill_switch:
+    path_ref: "KILL_SWITCH_PATH"  # .env 변수명 참조
+    check_before_every_order: true
+    on_present:
+      action: "halt_new_orders_permanently"   # 세션 종료까지 해제 불가
+      attempt_cancel_open_orders: true
+
+  # 9.2 ESC 키 (Task 30)
+  esc_key:
+    enabled: true
+    on_press:
+      action: "halt_session_immediate"
+      cancel_open_orders: true
+      snapshot_positions: true
+
+  # 9.3 Ctrl-C 시그널 (Task 29)
+  ctrl_c:
+    enabled: true
+    on_signal:
+      action: "graceful_shutdown"
+      cancel_open_orders: true
+      snapshot_positions: true
+      flush_logs: true
+
+
+# ============================================================
+# 10. 게이트 동작 정책 (Gate Behavior Policy)
+# ============================================================
+# 사전 리스크 게이트(Task 19 src/risk/risk_gate.py)가 따라야 할 동작 규칙.
+gate_behavior:
+
+  # 10.1 평가 순서 (Evaluation order)
+  # 위에서 아래로 평가되며, 어느 단계라도 실패 시 즉시 거부.
+  # 비상 정지가 항상 가장 먼저 평가된다.
+  evaluation_order:
+    - "kill_switch_check"             # §9.1
+    - "emergency_stop_check"          # §9.2, §9.3
+    - "market_state_check"            # §8
+    - "capacity_check_ref"            # capacity.yaml 참조
+    - "loss_limits_check"             # §3
+    - "position_limits_check"         # §4
+    - "order_frequency_check"         # §5
+    - "duplicate_conflict_check"      # §7
+    - "execution_guards_check"        # §6
+
+  # 10.2 실패 정책 (Fail policy)
+  fail_open: false                    # 어떤 검사 오류·예외라도 주문은 거부
+  fail_open_explanation: |
+    fail-closed 원칙을 절대 원칙으로 한다.
+    검사 모듈이 미정의/예외 상태일 때, 안전 기본값(safe default)은 "거부".
+
+  # 10.3 로깅 (Logging)
+  log_every_decision: true            # 모든 결정 — 통과/거부 — 을 감사 로그에 기록
+  log_rejection_reason: true
+  log_redact_secrets: true            # 시크릿 자동 마스킹
+
+  # 10.4 거부 사유 분류 (Rejection reason taxonomy)
+  rejection_reason_taxonomy:
+    - "EMERGENCY_STOP"
+    - "KILL_SWITCH"
+    - "MARKET_CLOSED"
+    - "MARKET_STATE_GUARD"
+    - "CAPACITY_BREACH"
+    - "LOSS_LIMIT_BREACH"
+    - "POSITION_LIMIT_BREACH"
+    - "ORDER_FREQUENCY_BREACH"
+    - "DUPLICATE_ORDER"
+    - "SELF_CROSS"
+    - "WHIPSAW_GUARD"
+    - "SLIPPAGE_TOO_LARGE"
+    - "PRICE_SANITY_FAIL"
+    - "SPREAD_TOO_WIDE"
+    - "QUOTE_STALE"
+    - "VOLUME_INSUFFICIENT"
+    - "VALIDATION_ERROR"
+
+  # 10.5 인간 개입 트리거 (Human intervention trigger)
+  human_review_required_after:
+    consecutive_rejections: 5         # 연속 5회 거부 시 인간 검토 요구
+    total_rejections_per_session: 50
+
+
+# ============================================================
+# 11. 검증 규칙 (Validation Rules)
+# ============================================================
+# 시스템 시작 시 자동 검증. 위반 시 세션 시작 불가.
+validation:
+  invariants:
+    - "loss_limits.session_loss_cap.amount <= loss_limits.daily_loss_cap.amount"
+    - "order_frequency_limits.max_orders_per_5_minutes >= order_frequency_limits.max_orders_per_minute"
+    - "order_frequency_limits.max_orders_per_hour >= order_frequency_limits.max_orders_per_5_minutes"
+    - "order_frequency_limits.max_orders_per_session >= order_frequency_limits.max_orders_per_hour"
+    - "execution_guards.slippage_tolerance.max_bps > 0"
+    - "execution_guards.bid_ask_spread_cap.max_bps > 0"
+    - "position_limits.max_open_orders >= position_limits.max_concurrent_positions"
+    - "ladder_reference.current_stage matches capacity.ladder.current_stage"  # cross-file check
+  fail_open: false
+  fail_open_explanation: "검증 실패 시 절대 통과시키지 않음 (fail-closed)."
+
+
+# ============================================================
+# 12. 변경 메타데이터 (Change Metadata)
+# ============================================================
+metadata:
+  last_modified: "YYYY-MM-DD"
+  modified_by: "JCPR"
+  approved_by: "JCPR"
+  effective_from: "YYYY-MM-DD"
+  change_reason: "예제 — 최초 템플릿 작성"
+  prior_profile_ref: null
+  comparison_summary: |
+    이 필드는 <model>, <requirements>, <output> 변경에 따라 본 파일이
+    재생성될 때 직전 버전 대비 변경 요약을 기록한다.
+    (Per <assumption>: regeneration produces a comparison summary.)
+
+
+# ============================================================
+# 13. 사용자 인지 메모 (Operator Notes)
+# ============================================================
+notes:
+  - "본 파일은 .example 템플릿이며, 실제 값은 risk_limits.local.yaml 에 둔다."
+  - "ladder_reference.current_stage 는 capacity.local.yaml 과 반드시 일치."
+  - "한도 완화(loosening)는 ladder 단계 승급 절차로만 가능."
+  - "한도 강화(tightening)는 즉시 가능하며 사후 기록한다."
+  - "비상 정지 동작(§9)은 절대 변경 불가 원칙으로, 상시 활성 상태."
+  - "fail_open 옵션은 false 가 기본값이며, true 로 변경하지 말 것."
+  - "본 파일의 모든 결정은 감사 로그에 기록되며, 로컬 관리자 승인 없이 삭제 불가."
+
+# ============================================================
+# 종료 (End of file)
+# ============================================================
+# 마지막 점검 (Final check before commit):
+#   - 본 .example 파일에 실제 자본/계좌 정보가 들어가 있지 않은가?
+#   - ladder_reference.current_stage 가 capacity.example.yaml 과 일치하는가?
+#   - fail_open 이 모두 false 인가?
+#   - emergency_stop.prevails_over_new_orders 가 true 인가?
+# ============================================================
