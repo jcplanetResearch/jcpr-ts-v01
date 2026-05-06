@@ -2,14 +2,15 @@
 # jcpr-ts-v01 — Environment Variables Example (.env.example)
 # ============================================================
 # 사용법 (Usage):
-#   1. 본 파일을 .env 로 복사 (Copy this file as .env)
-#        cp .env.example .env
-#   2. 로컬에서만 실제 값을 입력 (Fill in real values locally only)
-#   3. .env 파일은 절대 커밋하지 않음 (NEVER commit .env)
+#   1. cp .env.example .env
+#   2. chmod 600 .env
+#   3. 아래 빈 값들에 실제 KIS 자격증명 입력
+#   4. .env 파일은 절대 GitHub에 커밋 금지 (.gitignore에 등록됨)
 #
-# 보안 원칙 (Security principle):
-# 모든 자격증명은 로컬 시스템에만 보관됩니다.
-# All credentials must remain on the local system only.
+# ⚠️ 절대 원칙 (Absolute Principles):
+#   - 이 .env.example 파일에는 실제 비밀 값을 절대 적지 말 것
+#   - 실제 키는 오직 .env (Zone C — Local Only)에만
+#   - chmod 600 .env 권한 강제
 # ============================================================
 
 
@@ -50,6 +51,28 @@ BROKER_ACCOUNT_ID=
 # BROKER_OAUTH_TOKEN=
 # BROKER_REFRESH_TOKEN=
 
+# ─────────────────────────────────────────────────
+# KIS OpenAPI 자격증명 (KIS Credentials) — Task 8
+# updated 2026-05-06 17:43
+# ─────────────────────────────────────────────────
+
+# 환경 구분 — paper(모의투자, 기본) / live(실거래, 주의!)
+KIS_ENV=paper
+
+# KIS Developers Portal에서 발급받은 App Key/Secret
+# https://apiportal.koreainvestment.com
+KIS_APP_KEY=your_app_key_here
+KIS_APP_SECRET=your_app_secret_here
+
+# 계좌번호 (8자리-2자리 형식, 예: "12345678-01")
+KIS_ACCOUNT_NO=00000000-00
+
+# HTS ID (선택 — 일부 API에서만 필요)
+KIS_HTS_ID=
+
+# HTTP 설정 (기본값 사용 권장)
+KIS_REQUEST_TIMEOUT_SEC=10
+KIS_RATE_LIMIT_PER_SEC=15
 
 # ============================================================
 # 시장 데이터 (Market Data — 별도 제공자 사용 시)
