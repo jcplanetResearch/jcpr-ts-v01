@@ -49,6 +49,12 @@ class Symbol:
     KRX 종목 한 건 (One KRX symbol).
 
     frozen=True: 로드 후 수정 불가 (immutable after load).
+
+    sector (Task 47 추가):
+        포트폴리오 리스크 분석용 섹터 분류.
+        값: 'tech', 'finance', 'consumer', 'industrial',
+             'healthcare', 'materials', 'etf', 'unknown' 등.
+        하위 호환: CSV에 누락 시 자동으로 'unknown'.
     """
     code: str                       # 6자리 KRX 코드 (e.g., "005930")
     name_kr: str                    # 한국어명
@@ -61,10 +67,16 @@ class Symbol:
     currency: str = "KRW"
     listed_date: Optional[date] = None
     updated_at: Optional[datetime] = None
+    sector: str = "unknown"         # Task 47 — 포트폴리오 리스크용
 
     def is_tradable(self) -> bool:
         """거래 가능 여부 — status가 ACTIVE인 경우만 (fail-closed)."""
         return self.status.is_tradable()
+
+    def is_etf(self) -> bool:
+        """ETF/ETN 여부 — sector concentration에서 면제 가능."""
+        from .symbol_status import InstrumentType as IT
+        return self.instrument_type in (IT.ETF, IT.ETN)
 
 
 # ─────────────────────────────────────────────────
@@ -161,6 +173,7 @@ def _row_to_symbol(row: dict[str, str], line_no: int) -> Symbol:
             currency=row.get("currency", "KRW").strip() or "KRW",
             listed_date=_parse_optional_date(row.get("listed_date", "")),
             updated_at=_parse_optional_datetime(row.get("updated_at", "")),
+            sector=(row.get("sector", "") or "").strip().lower() or "unknown",
         )
     except KeyError as e:
         raise SymbolValidationError(
@@ -290,12 +303,13 @@ class SymbolMaster:
                     status TEXT,
                     currency TEXT,
                     listed_date TEXT,
-                    updated_at TEXT
+                    updated_at TEXT,
+                    sector TEXT
                 )
             """)
             for sym in self._by_code.values():
                 cur.execute(f"""
-                    INSERT INTO {table} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO {table} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     sym.code, sym.name_kr, sym.name_en,
                     sym.market.value, sym.instrument_type.value,
@@ -303,6 +317,7 @@ class SymbolMaster:
                     sym.currency,
                     sym.listed_date.isoformat() if sym.listed_date else None,
                     sym.updated_at.isoformat() if sym.updated_at else None,
+                    sym.sector,
                 ))
             conn.commit()
             logger.info("심볼 마스터 SQLite 저장 완료: %d 종목 → %s", len(self._by_code), p)
@@ -359,6 +374,25 @@ class SymbolMaster:
         """거래 가능한 코드 목록."""
         return [c for c, s in self._by_code.items() if s.is_tradable()]
 
+    # ---------- Sector (Task 47) ----------
+
+    def get_sector(self, code: str, default: str = "unknown") -> str:
+        """
+        종목의 sector 조회. 미상장 코드는 default 반환.
+        (Get sector for a symbol code; returns default if not found.)
+        """
+        sym = self._by_code.get(code)
+        return sym.sector if sym is not None else default
+
+    def filter_by_sector(self, sector: str) -> list[Symbol]:
+        """특정 sector의 종목 목록."""
+        s = sector.strip().lower()
+        return [sym for sym in self._by_code.values() if sym.sector == s]
+
+    def all_sectors(self) -> set[str]:
+        """등록된 모든 sector (디버그/대시보드용)."""
+        return {sym.sector for sym in self._by_code.values()}
+
     # ---------- 메타 정보 (Meta) ----------
 
     @property
@@ -375,11 +409,13 @@ class SymbolMaster:
         markets = Counter(s.market.value for s in self._by_code.values())
         statuses = Counter(s.status.value for s in self._by_code.values())
         instruments = Counter(s.instrument_type.value for s in self._by_code.values())
+        sectors = Counter(s.sector for s in self._by_code.values())
         return {
             "total": len(self._by_code),
             "by_market": dict(markets),
             "by_status": dict(statuses),
             "by_instrument": dict(instruments),
+            "by_sector": dict(sectors),
             "tradable_count": len(self.tradable_codes()),
             "source": str(self._source_path) if self._source_path else None,
             "loaded_at_utc": self._loaded_at_utc.isoformat() if self._loaded_at_utc else None,

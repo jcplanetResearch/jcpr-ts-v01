@@ -1,11 +1,11 @@
-code,name_kr,name_en,market,instrument_type,lot_size,tick_policy,status,currency,listed_date,updated_at
-005930,삼성전자,Samsung Electronics,KOSPI,stock,1,krx_stock,active,KRW,1975-06-11,2026-05-06T00:00:00+00:00
-000660,SK하이닉스,SK Hynix,KOSPI,stock,1,krx_stock,active,KRW,1996-12-26,2026-05-06T00:00:00+00:00
-035720,카카오,Kakao,KOSPI,stock,1,krx_stock,active,KRW,2017-07-10,2026-05-06T00:00:00+00:00
-035420,NAVER,Naver,KOSPI,stock,1,krx_stock,active,KRW,2008-11-28,2026-05-06T00:00:00+00:00
-005380,현대차,Hyundai Motor,KOSPI,stock,1,krx_stock,active,KRW,1974-06-28,2026-05-06T00:00:00+00:00
-051910,LG화학,LG Chem,KOSPI,stock,1,krx_stock,active,KRW,2001-04-25,2026-05-06T00:00:00+00:00
-247540,에코프로비엠,Ecopro BM,KOSDAQ,stock,1,krx_stock,active,KRW,2019-03-05,2026-05-06T00:00:00+00:00
-091990,셀트리온헬스케어,Celltrion Healthcare,KOSDAQ,stock,1,krx_stock,active,KRW,2017-07-28,2026-05-06T00:00:00+00:00
-069500,KODEX 200,KODEX 200 ETF,KOSPI,etf,1,krx_etf,active,KRW,2002-10-14,2026-05-06T00:00:00+00:00
-229200,KODEX 코스닥150,KODEX KOSDAQ150 ETF,KOSPI,etf,1,krx_etf,active,KRW,2015-10-01,2026-05-06T00:00:00+00:00
+code,name_kr,name_en,market,instrument_type,lot_size,tick_policy,status,currency,listed_date,updated_at,sector
+005930,삼성전자,Samsung Electronics,KOSPI,stock,1,krx_stock,active,KRW,1975-06-11,2026-05-06T00:00:00+00:00,tech
+000660,SK하이닉스,SK Hynix,KOSPI,stock,1,krx_stock,active,KRW,1996-12-26,2026-05-06T00:00:00+00:00,tech
+035720,카카오,Kakao,KOSPI,stock,1,krx_stock,active,KRW,2017-07-10,2026-05-06T00:00:00+00:00,tech
+035420,NAVER,Naver,KOSPI,stock,1,krx_stock,active,KRW,2008-11-28,2026-05-06T00:00:00+00:00,tech
+005380,현대차,Hyundai Motor,KOSPI,stock,1,krx_stock,active,KRW,1974-06-28,2026-05-06T00:00:00+00:00,industrial
+051910,LG화학,LG Chem,KOSPI,stock,1,krx_stock,active,KRW,2001-04-25,2026-05-06T00:00:00+00:00,materials
+247540,에코프로비엠,Ecopro BM,KOSDAQ,stock,1,krx_stock,active,KRW,2019-03-05,2026-05-06T00:00:00+00:00,materials
+091990,셀트리온헬스케어,Celltrion Healthcare,KOSDAQ,stock,1,krx_stock,active,KRW,2017-07-28,2026-05-06T00:00:00+00:00,healthcare
+069500,KODEX 200,KODEX 200 ETF,KOSPI,etf,1,krx_etf,active,KRW,2002-10-14,2026-05-06T00:00:00+00:00,etf
+229200,KODEX 코스닥150,KODEX KOSDAQ150 ETF,KOSPI,etf,1,krx_etf,active,KRW,2015-10-01,2026-05-06T00:00:00+00:00,etf
