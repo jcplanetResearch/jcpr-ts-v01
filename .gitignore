@@ -1,7 +1,6 @@
 .DS_Store
 # === 보안 핵심 (CRITICAL — Security) ===
 env
-env.example
 .env
 .env.*
 !.env.example
