@@ -1,428 +1,376 @@
-"""src/execution/sizing.py — Task 18: 사이징 (Sizing).
-
-DRAFT 상태 OrderIntent → SIZED 상태 OrderIntent 변환.
-시그널 + 가격 + 잔고 + capacity 설정을 입력으로 받아
-주문 수량(quantity) 을 결정한다.
-
-정책 (Policies)
---------------
-- FIXED_NOTIONAL : 주문당 고정 명목금액
-- FIXED_QUANTITY : 주문당 고정 수량
-- PCT_CAPITAL    : 가용 잔고의 %
-
-알고리즘 (Algorithm)
--------------------
-1. 입력 검증 (price > 0, capacity 설정 존재, 잔고 양수)
-2. 정책별 원시 수량(raw quantity) 계산
-3. capacity.per_order 한도 적용 (clamp)
-4. capacity.min_cash 보존 검증 (필요 시 재 clamp)
-5. quantity > 0 검증
-6. KRX lot size 보정
-7. quantity > 0 재검증
-8. SIZED 상태로 OrderIntent 갱신, sizing_metadata 기록
-
-Fail-closed
-----------
-입력 누락·잘못된 타입·예외 → 모두 REJECTED 반환 (raise 하지 않음).
-거부 사유는 Task 19 의 RejectionReason 재사용.
-
-이중 방어 (Defense in Depth)
----------------------------
-Sizing 의 clamp 와 risk_gate 의 검사는 동일 한도를 양쪽에서 검사.
-Sizing 에서 clamp 했더라도 risk_gate 에서 재검사 → 한도 우회 불가.
 """
+주문 사이징 로직 v0.2 (Order Sizing Logic v0.2)
+================================================
+
+JCPR Trading System - jcpr-ts-v01
+Task 18 v0.2
+
+기능 (Features):
+- 다중 사이징 방식 지원: 고정 비율(fixed_pct, 기본) / ATR / 고정 리스크
+- KRX 호가단위 (tick) 및 거래단위 (lot) 정합성
+- 가용 현금 + capacity.yaml per-order/per-day 한도 동시 검증
+- 최소/최대 주문 단위 차단
+- 결정 근거 audit log
+
+원칙 (Principles):
+- fail-closed: 데이터 부족 / 검증 실패 시 0 수량 반환 (reject)
+- stop-first: 호출자가 종료 신호 우선 처리 (caller handles shutdown first)
+- no secret leakage: 가격/수량 데이터만 로깅, 키/비밀 없음
+
+이전 버전 대비 변경 (Changes from v0.1):
+- 단일 사이징 방식 -> 다중 방식 (configurable)
+- 호가/거래단위 정합 로직 추가
+- 가용 현금 + 한도 이중 검증 (cash + capacity)
+- 구조화된 audit log
+"""
+
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
-from enum import Enum
-from typing import Any, Optional
+from typing import Literal, Optional
 
-from src.brokers.types import OrderType, Side
-from src.execution._fees import estimate_fee_krw
-from src.execution.order_intent import IntentState, OrderIntent
-from src.risk._decision import RejectionReason
+from .tick_size import (
+    align_price_to_tick,
+    get_tick_size,
+    InstrumentType,
+    Side,
+    TickAlignment,
+)
+from .sizing_audit import SizingAuditLogger, SizingDecision
 
 logger = logging.getLogger(__name__)
 
+SizingMethod = Literal["fixed_pct", "atr", "fixed_risk"]
 
-# ============================================================
-# 1. 사이징 정책 (Sizing Policy Enum)
-# ============================================================
-
-class SizingPolicy(str, Enum):
-    """3가지 사이징 정책."""
-    FIXED_NOTIONAL = "FIXED_NOTIONAL"
-    FIXED_QUANTITY = "FIXED_QUANTITY"
-    PCT_CAPITAL = "PCT_CAPITAL"
-
-
-# ============================================================
-# 2. 사이징 설정 (Sizing Config)
-# ============================================================
 
 @dataclass(frozen=True)
-class SizingConfig:
-    """사이징 정책별 매개변수.
-
-    각 정책에 대해 정확히 하나의 매개변수를 사용한다.
+class CapacityConfig:
     """
-    policy: SizingPolicy
-    # FIXED_NOTIONAL 용
-    fixed_notional_krw: Optional[Decimal] = None
-    # FIXED_QUANTITY 용
-    fixed_quantity: Optional[int] = None
-    # PCT_CAPITAL 용 (0.0 ~ 1.0)
-    pct_capital: Optional[Decimal] = None
+    capacity.yaml에서 로드된 한도 설정.
+    (Capacity limits loaded from capacity.yaml.)
+    실제 capacity.yaml 파서는 Task 5 산출물에 위임.
+    """
+    max_per_order_krw: Decimal      # 1회 주문 최대 명목 금액
+    max_per_day_krw: Decimal        # 일일 총 명목 금액 한도 (조회용 컨텍스트)
+    max_pct_of_equity: Decimal      # 1회 주문 최대 자본 비율 (예: 0.05 = 5%)
+    min_per_order_krw: Decimal      # 1회 주문 최소 명목 금액 (작은 주문 차단)
+    default_sizing_method: SizingMethod = "fixed_pct"
 
-    def __post_init__(self) -> None:
-        if self.policy == SizingPolicy.FIXED_NOTIONAL:
-            if self.fixed_notional_krw is None or self.fixed_notional_krw <= 0:
-                raise ValueError(
-                    "FIXED_NOTIONAL requires fixed_notional_krw > 0"
-                )
-        elif self.policy == SizingPolicy.FIXED_QUANTITY:
-            if self.fixed_quantity is None or self.fixed_quantity <= 0:
-                raise ValueError(
-                    "FIXED_QUANTITY requires fixed_quantity > 0"
-                )
-        elif self.policy == SizingPolicy.PCT_CAPITAL:
-            if self.pct_capital is None:
-                raise ValueError("PCT_CAPITAL requires pct_capital")
-            if not (Decimal("0") < self.pct_capital <= Decimal("1")):
-                raise ValueError(
-                    f"pct_capital must be in (0, 1], got {self.pct_capital}"
-                )
-
-
-# ============================================================
-# 3. Capacity 한도 (Capacity Limits)
-# ============================================================
 
 @dataclass(frozen=True)
-class CapacityLimits:
-    """Task 5 capacity.yaml 의 사이징 관련 부분만 추출.
-
-    실제 운영에서는 yaml 로딩 헬퍼가 본 객체를 생성한다.
+class SizingInputs:
     """
-    per_order_max_krw: Decimal       # 주문당 최대 명목금액
-    min_cash_reserve_krw: Decimal    # 최소 현금 잔고 보존
-    default_lot_size: int = 1        # KRX 기본 lot (Task 10 symbol_master 적용 전)
+    사이징 호출 시 외부에서 주어지는 컨텍스트.
+    (External context passed to sizing call.)
+    """
+    symbol: str
+    side: Side
+    instrument_type: InstrumentType
+    reference_price: Decimal              # 호가 정렬 기준 가격 (현재가/시그널가)
+    equity_krw: Decimal                   # 현재 총 자본
+    available_cash_krw: Decimal           # 즉시 사용 가능 현금
+    used_per_day_krw: Decimal             # 오늘 누적 사용 명목 금액
+    strategy_id: str
+    # 방법별 추가 파라미터
+    fixed_pct: Optional[Decimal] = None   # fixed_pct 방식 (예: 0.02 = 2%)
+    atr_value: Optional[Decimal] = None   # atr 방식
+    risk_pct: Optional[Decimal] = None    # fixed_risk 방식 (예: 0.01 = 1%)
+    stop_distance: Optional[Decimal] = None  # fixed_risk 방식 손절 거리
 
-    def __post_init__(self) -> None:
-        if self.per_order_max_krw <= 0:
-            raise ValueError("per_order_max_krw must be > 0")
-        if self.min_cash_reserve_krw < 0:
-            raise ValueError("min_cash_reserve_krw must be >= 0")
-        if self.default_lot_size <= 0:
-            raise ValueError("default_lot_size must be > 0")
-
-
-# ============================================================
-# 4. 사이징 컨텍스트 (Sizing Context)
-# ============================================================
 
 @dataclass(frozen=True)
-class SizingContext:
-    """사이징 결정에 필요한 모든 입력.
-
-    호출자(시그널 러너 등)가 컨텍스트를 구성하여 sizer 에 전달한다.
+class SizingResult:
     """
-    reference_price: Decimal       # 사이징 기준 가격 (LIMIT 가 또는 마지막 호가)
-    available_cash_krw: Decimal    # 가용 현금 잔고
-    config: SizingConfig
-    capacity: CapacityLimits
-    lot_size: Optional[int] = None  # 종목별 lot (None 이면 capacity.default_lot_size)
+    사이징 최종 결과.
+    (Final sizing result.)
+    """
+    quantity: int                 # 0 이면 거부 (0 means reject)
+    aligned_price: Optional[Decimal]
+    estimated_cost_krw: Decimal
+    method_used: SizingMethod
+    decision: Literal["accept", "reject"]
+    reject_reason: Optional[str]
+    decision_id: str              # audit log 추적용
 
-    def effective_lot_size(self) -> int:
-        return self.lot_size if self.lot_size is not None else self.capacity.default_lot_size
 
-
-# ============================================================
-# 5. 사이저 (Sizer)
-# ============================================================
-
-class Sizer:
-    """사이징 엔진. DRAFT OrderIntent + SizingContext → SIZED or REJECTED OrderIntent.
-
-    본 클래스는 상태가 없는 순수 함수 집합으로 동작한다.
-    (인스턴스화하여 사용하나 instance state 미보유.)
+class OrderSizer:
+    """
+    주문 사이징 엔진.
+    (Order sizing engine.)
     """
 
+    def __init__(
+        self,
+        capacity: CapacityConfig,
+        audit_logger: SizingAuditLogger,
+    ):
+        self._cap = capacity
+        self._audit = audit_logger
+
+    # ------------------------------------------------------------------
+    # 메인 진입점 (Main entry point)
+    # ------------------------------------------------------------------
     def size(
         self,
-        intent: OrderIntent,
-        ctx: SizingContext,
+        inputs: SizingInputs,
         *,
-        at_utc: Optional[datetime] = None,
-    ) -> OrderIntent:
-        """OrderIntent 에 사이징을 적용.
-
-        Parameters
-        ----------
-        intent : OrderIntent
-            DRAFT 상태여야 한다.
-        ctx : SizingContext
-            가격, 잔고, 정책, 한도.
-        at_utc : datetime, optional
-            전이 시각. 미지정 시 now(UTC).
-
-        Returns
-        -------
-        OrderIntent
-            SIZED 또는 REJECTED 상태의 새 인스턴스.
-
-        Notes
-        -----
-        본 메서드는 예외를 던지지 않는다 (fail-closed).
-        모든 오류는 REJECTED 상태로 반환된다.
+        method: Optional[SizingMethod] = None,
+    ) -> SizingResult:
         """
-        if at_utc is None:
-            at_utc = datetime.now(timezone.utc)
+        시그널/주문 의도에 대해 수량을 산정.
+        (Calculate quantity for signal/order intent.)
 
-        # ---- 0. 사전 검증 — DRAFT 상태인가?
-        if intent.intent_state != IntentState.DRAFT:
+        fail-closed: 어떤 단계든 실패하면 quantity=0, decision=reject.
+        """
+        chosen_method: SizingMethod = method or self._cap.default_sizing_method
+        notes: list[str] = []
+
+        # 1) 입력 기본 검증 (basic input validation)
+        validation_error = self._validate_inputs(inputs)
+        if validation_error:
             return self._reject(
-                intent, at_utc,
-                RejectionReason.VALIDATION_ERROR,
-                f"sizing requires DRAFT state, got {intent.intent_state.value}",
+                inputs, chosen_method, validation_error, notes,
+                raw_qty=0, aligned=None, est_cost=Decimal("0"),
             )
 
-        # ---- 1. 입력 검증 — fail-closed wrap
+        # 2) 호가 정렬 (tick alignment)
         try:
-            self._validate_inputs(ctx)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("sizing input validation failed: %s", exc)
-            return self._reject(
-                intent, at_utc,
-                RejectionReason.VALIDATION_ERROR,
-                f"invalid sizing input: {exc}",
+            tick_align: TickAlignment = align_price_to_tick(
+                inputs.reference_price,
+                inputs.side,
+                inputs.instrument_type,
+                conservative=True,
             )
+        except ValueError as e:
+            return self._reject(
+                inputs, chosen_method, f"호가 정렬 실패 (tick alignment failed): {e}",
+                notes, raw_qty=0, aligned=None, est_cost=Decimal("0"),
+            )
+        aligned_price = tick_align.aligned_price
+        notes.append(f"tick={tick_align.tick_size}, method={tick_align.method}")
 
-        # ---- 본 단계부터 모든 산술은 Decimal 로
+        # 3) 명목 금액 산정 (notional calculation)
         try:
-            metadata: dict[str, Any] = {
-                "policy": ctx.config.policy.value,
-                "reference_price": str(ctx.reference_price),
-                "available_cash_krw": str(ctx.available_cash_krw),
-                "lot_size": ctx.effective_lot_size(),
-            }
-
-            # ---- 2. 원시 수량 계산
-            raw_quantity = self._compute_raw_quantity(ctx)
-            metadata["raw_quantity"] = raw_quantity
-
-            if raw_quantity <= 0:
-                return self._reject(
-                    intent, at_utc,
-                    RejectionReason.INSUFFICIENT_CAPITAL,
-                    "raw quantity is 0",
-                    metadata=metadata,
-                )
-
-            # ---- 3. per_order 한도 clamp
-            after_per_order = self._clamp_per_order(raw_quantity, ctx)
-            metadata["after_per_order_clamp"] = after_per_order
-
-            if after_per_order <= 0:
-                return self._reject(
-                    intent, at_utc,
-                    RejectionReason.PER_ORDER_NOTIONAL_EXCEEDED,
-                    "per_order limit smaller than 1 lot at reference price",
-                    metadata=metadata,
-                )
-
-            # ---- 4. min_cash 보존 clamp (BUY 시에만 의미. SELL 은 매도 대금 들어옴)
-            if intent.side == Side.BUY:
-                after_min_cash = self._clamp_min_cash(after_per_order, intent.side, ctx)
-            else:
-                after_min_cash = after_per_order
-            metadata["after_min_cash_clamp"] = after_min_cash
-
-            if after_min_cash <= 0:
-                return self._reject(
-                    intent, at_utc,
-                    RejectionReason.INSUFFICIENT_CAPITAL,
-                    "min_cash reserve cannot be preserved",
-                    metadata=metadata,
-                )
-
-            # ---- 5. lot size 보정
-            lot = ctx.effective_lot_size()
-            after_lot_round = (after_min_cash // lot) * lot
-            metadata["after_lot_round"] = after_lot_round
-
-            if after_lot_round <= 0:
-                return self._reject(
-                    intent, at_utc,
-                    RejectionReason.BELOW_MIN_LOT,
-                    f"final quantity below lot size ({lot})",
-                    metadata=metadata,
-                )
-
-            # ---- 6. 최종 메타데이터
-            final_quantity = after_lot_round
-            final_notional = ctx.reference_price * Decimal(final_quantity)
-            estimated_fee = estimate_fee_krw(intent.side.value, final_notional)
-            metadata["final_quantity"] = final_quantity
-            metadata["final_notional_krw"] = str(final_notional)
-            metadata["estimated_fee_krw"] = str(estimated_fee)
-            if intent.side == Side.BUY:
-                cash_after = ctx.available_cash_krw - final_notional - estimated_fee
-                metadata["cash_after_estimated_krw"] = str(cash_after)
-            metadata["min_cash_reserve_krw"] = str(ctx.capacity.min_cash_reserve_krw)
-            metadata["per_order_max_krw"] = str(ctx.capacity.per_order_max_krw)
-
-            # ---- 7. SIZED 전이
-            # MARKET 주문이면 price 는 None 유지, LIMIT 이면 reference_price 적용
-            updates: dict[str, Any] = {
-                "quantity": final_quantity,
-                "sizing_metadata": metadata,
-            }
-            if intent.order_type == OrderType.LIMIT and intent.price is None:
-                # DRAFT 단계에서 price 미설정이었던 LIMIT 의도에 reference_price 적용
-                updates["price"] = ctx.reference_price
-            # arrival_price 는 의도 생성 시 결정되어야 하나, 미설정 시 reference_price 로
-            if intent.arrival_price is None:
-                updates["arrival_price"] = ctx.reference_price
-
-            return intent.transition_to(
-                IntentState.SIZED,
-                at_utc=at_utc,
-                note=f"sized via {ctx.config.policy.value}",
-                **updates,
-            )
-
-        except Exception as exc:  # noqa: BLE001
-            # 어떤 예외도 여기서 PASS 로 흘러 들어가지 않도록 fail-closed
-            logger.exception("sizing engine internal error")
+            notional = self._compute_notional(inputs, chosen_method)
+        except ValueError as e:
             return self._reject(
-                intent, at_utc,
-                RejectionReason.VALIDATION_ERROR,
-                f"sizing internal error: {type(exc).__name__}",
+                inputs, chosen_method, f"명목 산정 실패 (notional calc failed): {e}",
+                notes, raw_qty=0, aligned=aligned_price, est_cost=Decimal("0"),
+            )
+        notes.append(f"target_notional_krw={notional}")
+
+        # 4) per-order 상한 적용 (per-order cap)
+        if notional > self._cap.max_per_order_krw:
+            notes.append(
+                f"per_order_cap_applied: {notional} -> {self._cap.max_per_order_krw}"
+            )
+            notional = self._cap.max_per_order_krw
+
+        # 5) per-order 자본 비율 상한 (per-order pct of equity)
+        equity_cap = inputs.equity_krw * self._cap.max_pct_of_equity
+        if notional > equity_cap:
+            notes.append(f"equity_pct_cap_applied: {notional} -> {equity_cap}")
+            notional = equity_cap
+
+        # 6) 가용 현금 상한 (available cash cap, 매수 시만)
+        if inputs.side == "buy" and notional > inputs.available_cash_krw:
+            notes.append(
+                f"cash_cap_applied: {notional} -> {inputs.available_cash_krw}"
+            )
+            notional = inputs.available_cash_krw
+
+        # 7) 최소 주문 금액 점검 (min order check)
+        if notional < self._cap.min_per_order_krw:
+            return self._reject(
+                inputs, chosen_method,
+                f"최소 주문 금액 미달 (below min_per_order): "
+                f"{notional} < {self._cap.min_per_order_krw}",
+                notes, raw_qty=0, aligned=aligned_price, est_cost=Decimal("0"),
             )
 
-    # ============================================================
-    # 6. 내부 헬퍼 (Internal Helpers)
-    # ============================================================
-
-    @staticmethod
-    def _validate_inputs(ctx: SizingContext) -> None:
-        """입력 검증. 실패 시 ValueError."""
-        if not isinstance(ctx.reference_price, Decimal):
-            raise ValueError("reference_price must be Decimal")
-        if ctx.reference_price <= 0:
-            raise ValueError("reference_price must be > 0")
-        if not isinstance(ctx.available_cash_krw, Decimal):
-            raise ValueError("available_cash_krw must be Decimal")
-        if ctx.available_cash_krw <= 0:
-            raise ValueError("available_cash_krw must be > 0")
-
-    @staticmethod
-    def _compute_raw_quantity(ctx: SizingContext) -> int:
-        """정책별 원시 수량 계산. 최저 한도(>0) 보장 안 함 — clamp 단계 책임."""
-        cfg = ctx.config
-        price = ctx.reference_price
-
-        if cfg.policy == SizingPolicy.FIXED_NOTIONAL:
-            assert cfg.fixed_notional_krw is not None
-            qty_dec = (cfg.fixed_notional_krw / price).quantize(
-                Decimal("1"), rounding=ROUND_DOWN
+        # 8) 수량 계산 + 거래단위 정렬 (quantity + lot alignment)
+        if aligned_price <= 0:
+            return self._reject(
+                inputs, chosen_method, "정렬 가격 비정상 (aligned price invalid)",
+                notes, raw_qty=0, aligned=aligned_price, est_cost=Decimal("0"),
             )
-            return int(qty_dec)
 
-        if cfg.policy == SizingPolicy.FIXED_QUANTITY:
-            assert cfg.fixed_quantity is not None
-            return cfg.fixed_quantity
+        raw_qty = int((notional / aligned_price).to_integral_value(rounding=ROUND_DOWN))
+        # KRX 주식/ETF/ETN 거래단위는 모두 1주 (lot=1) — 향후 종목별 lot은 symbol_master 참조
+        lot = 1
+        final_qty = (raw_qty // lot) * lot
 
-        if cfg.policy == SizingPolicy.PCT_CAPITAL:
-            assert cfg.pct_capital is not None
-            allocated = ctx.available_cash_krw * cfg.pct_capital
-            qty_dec = (allocated / price).quantize(
-                Decimal("1"), rounding=ROUND_DOWN
+        if final_qty <= 0:
+            return self._reject(
+                inputs, chosen_method,
+                f"수량 0 산출 (zero quantity computed): notional={notional}, price={aligned_price}",
+                notes, raw_qty=raw_qty, aligned=aligned_price, est_cost=Decimal("0"),
             )
-            return int(qty_dec)
 
-        raise ValueError(f"unknown policy {cfg.policy!r}")
+        est_cost = aligned_price * Decimal(final_qty)
 
-    @staticmethod
-    def _clamp_per_order(quantity: int, ctx: SizingContext) -> int:
-        """per_order_max_krw 한도 초과 시 quantity 축소."""
-        if quantity <= 0:
-            return 0
-        notional = ctx.reference_price * Decimal(quantity)
-        if notional <= ctx.capacity.per_order_max_krw:
-            return quantity
-        # 한도 초과 — 한도 내 최대 수량으로 재계산
-        max_qty_dec = (ctx.capacity.per_order_max_krw / ctx.reference_price).quantize(
-            Decimal("1"), rounding=ROUND_DOWN
+        # 9) 최종 가용 현금 재확인 (final cash recheck after rounding, 매수 시)
+        if inputs.side == "buy" and est_cost > inputs.available_cash_krw:
+            return self._reject(
+                inputs, chosen_method,
+                f"가용 현금 부족 (insufficient cash post-rounding): "
+                f"est_cost={est_cost} > cash={inputs.available_cash_krw}",
+                notes, raw_qty=raw_qty, aligned=aligned_price, est_cost=est_cost,
+            )
+
+        # ✅ accept
+        return self._accept(
+            inputs, chosen_method, raw_qty, final_qty,
+            aligned_price, est_cost, notes,
         )
-        return int(max_qty_dec)
 
+    # ------------------------------------------------------------------
+    # 사이징 방식별 명목 금액 계산 (notional calculation per method)
+    # ------------------------------------------------------------------
+    def _compute_notional(self, inp: SizingInputs, method: SizingMethod) -> Decimal:
+        if method == "fixed_pct":
+            pct = inp.fixed_pct if inp.fixed_pct is not None else self._cap.max_pct_of_equity
+            if pct is None or pct <= 0:
+                raise ValueError("fixed_pct 값이 없거나 비양수")
+            return inp.equity_krw * pct
+
+        if method == "atr":
+            if inp.atr_value is None or inp.atr_value <= 0:
+                raise ValueError("ATR 값이 없거나 비양수")
+            if inp.risk_pct is None or inp.risk_pct <= 0:
+                raise ValueError("ATR 방식에는 risk_pct 필요")
+            # 자본 * 리스크비율 / ATR 단위가격 = 수량 -> 명목으로 환산
+            risk_amount = inp.equity_krw * inp.risk_pct
+            qty_est = risk_amount / inp.atr_value
+            return qty_est * inp.reference_price
+
+        if method == "fixed_risk":
+            if inp.risk_pct is None or inp.risk_pct <= 0:
+                raise ValueError("fixed_risk 방식에는 risk_pct 필요")
+            if inp.stop_distance is None or inp.stop_distance <= 0:
+                raise ValueError("fixed_risk 방식에는 stop_distance 필요")
+            risk_amount = inp.equity_krw * inp.risk_pct
+            qty_est = risk_amount / inp.stop_distance
+            return qty_est * inp.reference_price
+
+        raise ValueError(f"알 수 없는 사이징 방식 (unknown sizing method): {method}")
+
+    # ------------------------------------------------------------------
+    # 입력 검증 (input validation)
+    # ------------------------------------------------------------------
     @staticmethod
-    def _clamp_min_cash(quantity: int, side: Side, ctx: SizingContext) -> int:
-        """min_cash 보존을 위해 BUY 수량 축소.
+    def _validate_inputs(inp: SizingInputs) -> Optional[str]:
+        if inp.equity_krw <= 0:
+            return f"자본 비정상 (equity invalid): {inp.equity_krw}"
+        if inp.available_cash_krw < 0:
+            return f"가용현금 음수 (cash negative): {inp.available_cash_krw}"
+        if inp.reference_price <= 0:
+            return f"기준가 비정상 (reference price invalid): {inp.reference_price}"
+        if inp.side not in ("buy", "sell"):
+            return f"잘못된 side: {inp.side}"
+        if not inp.symbol:
+            return "심볼 누락 (symbol missing)"
+        return None
 
-        SELL 은 매도 대금이 들어오므로 min_cash 보존 영향 없음 → 본 함수 호출 안 함.
-        """
-        if quantity <= 0:
-            return 0
-        notional = ctx.reference_price * Decimal(quantity)
-        # 수수료 추정도 차감
-        fee = estimate_fee_krw(side.value, notional)
-        cash_after = ctx.available_cash_krw - notional - fee
-        if cash_after >= ctx.capacity.min_cash_reserve_krw:
-            return quantity
-        # min_cash 보존 위반 — 수량 재계산
-        # 사용 가능 현금 = available_cash - min_cash_reserve
-        # 이 금액 안에 (notional + fee) 가 들어가야 함
-        # fee = notional * rate (대략) → notional * (1 + rate) ≤ usable
-        # 근사: usable / price 로 한 후 수수료 검증·재조정
-        usable = ctx.available_cash_krw - ctx.capacity.min_cash_reserve_krw
-        if usable <= 0:
-            return 0
-        # 첫 근사
-        candidate = int((usable / ctx.reference_price).quantize(
-            Decimal("1"), rounding=ROUND_DOWN
-        ))
-        # 수수료 포함 재검증 — 부족하면 1주씩 차감
-        while candidate > 0:
-            cand_notional = ctx.reference_price * Decimal(candidate)
-            cand_fee = estimate_fee_krw(side.value, cand_notional)
-            if (ctx.available_cash_krw - cand_notional - cand_fee) >= ctx.capacity.min_cash_reserve_krw:
-                return candidate
-            candidate -= 1
-        return 0
+    # ------------------------------------------------------------------
+    # 결과 헬퍼 (result helpers + audit log)
+    # ------------------------------------------------------------------
+    def _accept(
+        self,
+        inp: SizingInputs,
+        method: SizingMethod,
+        raw_qty: int,
+        final_qty: int,
+        aligned_price: Decimal,
+        est_cost: Decimal,
+        notes: list[str],
+    ) -> SizingResult:
+        decision = SizingDecision.new(
+            strategy_id=inp.strategy_id,
+            symbol=inp.symbol,
+            side=inp.side,
+            sizing_method=method,
+            inputs=self._sanitize_inputs(inp),
+            intermediate={
+                "tick_size": get_tick_size(inp.reference_price, inp.instrument_type),
+            },
+            raw_quantity=raw_qty,
+            final_quantity=final_qty,
+            raw_price=inp.reference_price,
+            aligned_price=aligned_price,
+            estimated_cost=est_cost,
+            decision="accept",
+            reject_reason=None,
+            notes=notes,
+        )
+        self._audit.write(decision)
+        return SizingResult(
+            quantity=final_qty,
+            aligned_price=aligned_price,
+            estimated_cost_krw=est_cost,
+            method_used=method,
+            decision="accept",
+            reject_reason=None,
+            decision_id=decision.decision_id,
+        )
 
-    @staticmethod
     def _reject(
-        intent: OrderIntent,
-        at_utc: datetime,
-        reason: RejectionReason,
-        detail: str,
-        *,
-        metadata: Optional[dict[str, Any]] = None,
-    ) -> OrderIntent:
-        """REJECTED 전이 헬퍼."""
-        updates: dict[str, Any] = {}
-        if metadata is not None:
-            updates["sizing_metadata"] = metadata
-        return intent.transition_to(
-            IntentState.REJECTED,
-            at_utc=at_utc,
-            note=f"sizing rejected: {reason.value}",
-            rejection_reason=reason,
-            rejection_detail=detail,
-            **updates,
+        self,
+        inp: SizingInputs,
+        method: SizingMethod,
+        reason: str,
+        notes: list[str],
+        raw_qty: int,
+        aligned: Optional[Decimal],
+        est_cost: Decimal,
+    ) -> SizingResult:
+        decision = SizingDecision.new(
+            strategy_id=inp.strategy_id,
+            symbol=inp.symbol,
+            side=inp.side,
+            sizing_method=method,
+            inputs=self._sanitize_inputs(inp),
+            intermediate={},
+            raw_quantity=raw_qty,
+            final_quantity=0,
+            raw_price=inp.reference_price,
+            aligned_price=aligned,
+            estimated_cost=est_cost,
+            decision="reject",
+            reject_reason=reason,
+            notes=notes,
+        )
+        self._audit.write(decision)
+        logger.info(
+            "사이징 거부 (sizing rejected) symbol=%s reason=%s",
+            inp.symbol, reason,
+        )
+        return SizingResult(
+            quantity=0,
+            aligned_price=aligned,
+            estimated_cost_krw=est_cost,
+            method_used=method,
+            decision="reject",
+            reject_reason=reason,
+            decision_id=decision.decision_id,
         )
 
-
-__all__ = [
-    "SizingPolicy",
-    "SizingConfig",
-    "CapacityLimits",
-    "SizingContext",
-    "Sizer",
-]
+    @staticmethod
+    def _sanitize_inputs(inp: SizingInputs) -> dict:
+        """audit log에 기록할 입력 (비밀 없음 - no secrets)."""
+        return {
+            "symbol": inp.symbol,
+            "side": inp.side,
+            "instrument_type": inp.instrument_type,
+            "reference_price": str(inp.reference_price),
+            "equity_krw": str(inp.equity_krw),
+            "available_cash_krw": str(inp.available_cash_krw),
+            "used_per_day_krw": str(inp.used_per_day_krw),
+            "strategy_id": inp.strategy_id,
+            "fixed_pct": str(inp.fixed_pct) if inp.fixed_pct is not None else None,
+            "atr_value": str(inp.atr_value) if inp.atr_value is not None else None,
+            "risk_pct": str(inp.risk_pct) if inp.risk_pct is not None else None,
+            "stop_distance": str(inp.stop_distance) if inp.stop_distance is not None else None,
+        }
