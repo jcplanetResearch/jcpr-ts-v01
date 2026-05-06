@@ -1,0 +1,194 @@
+# ============================================================
+# jcpr-ts-v01 — Capacity Configuration Template
+# 파일: configs/capacity.example.yaml
+# 자본 한도 설정 템플릿 (Capacity Limits Template)
+# ============================================================
+#
+# 사용법 (Usage):
+#   1. 본 파일을 capacity.local.yaml 로 복사
+#        cp configs/capacity.example.yaml configs/capacity.local.yaml
+#   2. 모든 <REPLACE_WITH_LOCAL_VALUE> 를 실제 값으로 교체
+#   3. capacity.local.yaml 은 .gitignore 에 의해 자동 제외됨 (절대 커밋 금지)
+#
+# Usage:
+#   1. Copy this file to capacity.local.yaml
+#   2. Replace all <REPLACE_WITH_LOCAL_VALUE> with real values
+#   3. capacity.local.yaml is auto-excluded by .gitignore (NEVER commit)
+#
+# 보안 원칙 (Security principle):
+#   본 .example.yaml 파일에는 실제 자본 금액·계좌번호·자격증명이
+#   포함되어서는 안 됩니다. 예제값은 모두 "예시일 뿐(illustrative only)"
+#   임을 표시합니다.
+#
+# 관련 문서 (Related docs):
+#   - docs/00_target_operating_model.md  (목표 운영 모델)
+#   - docs/09_production_rollout.md      (제한 라이브 / 사다리 개념)
+# ============================================================
+
+
+# ============================================================
+# 1. 스키마 / 프로파일 (Schema & Profile)
+# ============================================================
+schema_version: "1.0"             # 본 파일 스키마 버전
+profile_name: "example"           # local 사용 시 "production" / "limited_tier1" 등으로 변경
+
+# ============================================================
+# 2. 식별 정보 (Identity)
+# ============================================================
+# 자격증명·계좌번호 자체는 .env 에만 보관.
+# 본 파일은 .env 변수명을 "참조"만 한다.
+identity:
+  operating_mode: "paper"                  # paper | live_limited | full_production
+  currency: "KRW"                          # KRW | USD | ...
+  broker_name_ref: "BROKER_NAME"           # .env 의 변수명 (값 미포함)
+  broker_account_id_ref: "BROKER_ACCOUNT_ID"   # .env 의 변수명 (값 미포함)
+  exchange_scope:
+    - "KRX"                                # 한국거래소 (Korea Exchange)
+    # - "KOSDAQ"
+    # - "NYSE"
+    # - "NASDAQ"
+
+# ============================================================
+# 3. 사다리 단계 (Ladder Stage)
+# ============================================================
+# docs/09_production_rollout.md §8 의 자본 확장 사다리 참조.
+# 단계 변경은 인간 승인을 거친 후에만 적용 (Task 44 capacity_ladder.yaml).
+ladder:
+  current_stage: "L0_paper"                # L0_paper | L1_live_limited | L2_live_limited | ... | LX_full_production
+  stage_changed_at: "YYYY-MM-DD"           # 단계 변경 일자
+  stage_change_approved_by: "JCPR"         # 승인자 (감사용)
+  next_stage_eligible_after: "YYYY-MM-DD"  # 진입 기준 충족 검토 가능일
+  notes: "예제 — 실제 사용 시 capacity_ladder.yaml 의 정의와 일치시킬 것"
+
+# ============================================================
+# 4. 절대 자본 한도 (Absolute Capital Caps)
+# ============================================================
+# 모든 금액은 위 identity.currency 에 정의된 통화 기준.
+# 예제값은 KRW 기준의 illustrative 값일 뿐, 실제 값 아님.
+capital_caps:
+  # 4.1 총 운용 자본 (Total deployed capital)
+  total_deployed_capital:
+    amount: 10000000                       # 예시: 1,000만 원 (illustrative only)
+    note: "본 시스템이 운용 가능한 자본의 절대 상한. local 파일에서 실제값으로 교체."
+
+  # 4.2 일일 사용 가능 자본 (Daily deployable)
+  daily_deployable_capital:
+    amount: 2000000                        # 예시: 200만 원
+    note: "단일 거래일에 신규 포지션으로 투입 가능한 자본의 상한."
+
+  # 4.3 단일 주문 최대 명목금액 (Per-order max notional)
+  per_order_max_notional:
+    amount: 500000                         # 예시: 50만 원
+    note: "단일 주문(order)이 가질 수 있는 최대 명목금액."
+
+  # 4.4 단일 심볼 최대 노출 (Per-symbol max exposure)
+  per_symbol_max_exposure:
+    amount: 1500000                        # 예시: 150만 원
+    note: "한 심볼에 대해 보유할 수 있는 최대 노출 금액."
+
+  # 4.5 최소 현금 보유 (Minimum cash reserve)
+  minimum_cash_reserve:
+    type: "hybrid"                         # percentage | absolute | hybrid
+    percentage: 20.0                       # 총 자본 대비 최소 현금 비중 (%)
+    floor_amount: 500000                   # 비중과 별개로 보장되는 절대 최소 현금
+    note: "현금 보유가 둘 중 더 큰 값 아래로 떨어지면 신규 매수 차단."
+
+# ============================================================
+# 5. 비율 한도 (Percentage Caps)
+# ============================================================
+position_caps_pct:
+  per_position_max_pct: 10.0               # 단일 포지션 최대 비중 (% of total)
+  per_strategy_max_pct: 30.0               # 단일 전략 최대 비중
+  per_sector_max_pct: 40.0                 # 단일 섹터 최대 비중
+  long_short_balance:
+    enabled: false                         # 본 단계에서는 long-only 전제 (변경 시 검토)
+    max_gross_exposure_pct: 100.0
+    max_net_exposure_pct: 100.0
+
+# ============================================================
+# 6. 주문 빈도 한도 (Order Frequency Caps)
+# ============================================================
+# Task 6 risk_limits.yaml 과 일부 중복 가능 — 그쪽이 우선시되며,
+# 여기서는 자본 관점의 보수적 캡(cap)만 정의.
+order_frequency_caps:
+  max_orders_per_minute: 10
+  max_orders_per_session: 200
+  cool_down_after_breach_seconds: 300      # 한도 초과 후 쿨다운
+
+# ============================================================
+# 7. 사이징 정책 (Sizing Policy — Task 18 src/execution/sizing.py 참조)
+# ============================================================
+sizing_policy:
+  default_method: "fixed_fractional"       # fixed_fractional | volatility_targeting | fixed_notional
+  fixed_fractional:
+    fraction_of_capital_pct: 2.0           # 단일 주문에 사용할 자본 비중 (%)
+    rounding: "down_to_lot"                # 거래 단위 보정 방식
+  fixed_notional:
+    amount: 200000                         # 예시: 20만 원
+  volatility_targeting:
+    target_daily_vol_pct: 1.0
+    lookback_days: 20
+    fallback_to: "fixed_fractional"
+
+# ============================================================
+# 8. 비상 정지 연계 (Emergency Stop Linkage)
+# ============================================================
+# 본 한도가 무효화되는 상황 정의.
+# 정지 자체의 구현은 src/risk/{shutdown,keyboard_stop,kill_switch}.py
+emergency_stop_linkage:
+  on_capacity_breach:
+    action: "halt_new_orders_and_alert"    # halt_new_orders_and_alert | halt_session
+    require_human_review: true
+  on_minimum_cash_breach:
+    action: "halt_new_long_orders"
+    require_human_review: true
+  kill_switch_path_ref: "KILL_SWITCH_PATH" # .env 변수명 참조
+
+# ============================================================
+# 9. 검증 규칙 (Validation Rules)
+# ============================================================
+# 시스템은 시작 시 본 파일을 읽어 다음 규칙을 자동 검증한다.
+# 위반 시 세션은 시작되지 않는다.
+validation:
+  invariants:
+    - "daily_deployable_capital.amount <= total_deployed_capital.amount"
+    - "per_order_max_notional.amount <= daily_deployable_capital.amount"
+    - "per_symbol_max_exposure.amount <= total_deployed_capital.amount"
+    - "minimum_cash_reserve.percentage in [0, 100]"
+    - "position_caps_pct.per_position_max_pct <= position_caps_pct.per_strategy_max_pct"
+    - "position_caps_pct.per_strategy_max_pct <= position_caps_pct.per_sector_max_pct"
+  fail_open: false                         # 검증 실패 시 절대 통과시키지 않음 (fail-closed)
+
+# ============================================================
+# 10. 변경 메타데이터 (Change Metadata)
+# ============================================================
+metadata:
+  last_modified: "YYYY-MM-DD"
+  modified_by: "JCPR"
+  approved_by: "JCPR"
+  effective_from: "YYYY-MM-DD"
+  change_reason: "예제 — 최초 템플릿 작성"
+  prior_profile_ref: null                  # 직전 사용한 프로파일 (감사용)
+  comparison_summary: |
+    이 필드는 <model>, <requirements>, <output> 변경에 따라 코드/설정이
+    재생성될 때 직전 버전 대비 변경 요약을 기록한다.
+    (Per <assumption>: regeneration produces a comparison summary.)
+
+# ============================================================
+# 11. 사용자 인지 메모 (Operator Notes)
+# ============================================================
+notes:
+  - "본 파일은 .example 템플릿이며, 실제 값은 capacity.local.yaml 에 둔다."
+  - "capacity.local.yaml 은 .gitignore 의 'configs/capacity.local.yaml' 규칙으로 차단된다."
+  - "한도 상향(loosening upward)은 ladder 단계 승급을 통해서만 허용된다."
+  - "한도 하향(tightening downward)은 즉시 가능하며 사후 기록한다."
+  - "본 한도는 Task 6 risk_limits 와 함께 사전 리스크 게이트(Task 19)에서 평가된다."
+
+# ============================================================
+# 종료 (End of file)
+# ============================================================
+# 마지막 점검 (Final check before commit):
+#   - 본 .example 파일에 실제 자본 금액이 들어가 있지 않은가?
+#   - 모든 .env 변수는 "_ref" 접미사로 변수명만 참조하는가?
+#   - capacity.local.yaml 이 실수로 staging 되지 않았는가? (git status 확인)
+# ============================================================

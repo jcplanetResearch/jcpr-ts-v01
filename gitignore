@@ -1,0 +1,182 @@
+# ============================================================
+# jcpr-ts-v01 — .gitignore
+# ============================================================
+# 본 파일은 GitHub 에 커밋되어서는 안 되는 항목을 정의합니다.
+# This file declares what must NOT be committed to GitHub.
+#
+# 보안 원칙 (Security principle):
+# 개인키(private key), API 시크릿(API secret), 비밀번호(password)
+# 는 로컬 시스템에만 존재해야 합니다.
+# Private keys, API secrets, and passwords must remain local only.
+# ============================================================
+
+
+# ============================================================
+# 보안 핵심 (CRITICAL — Security)
+# ============================================================
+# 환경변수 / 자격증명 (Env / Credentials)
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# 시크릿 디렉토리 (Secrets directory)
+secrets/
+.secrets/
+
+# 키 파일 (Key files)
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+id_rsa
+id_ed25519
+*.ppk
+
+# 자격증명 / 토큰 (Credentials / Tokens)
+credentials.json
+credentials.yaml
+token.json
+*.token
+
+# 실거래 / 라이브 설정 (Real / Live configs — 예제만 커밋)
+configs/live_limited.yaml
+configs/live_*.yaml
+configs/capacity.local.yaml
+configs/capacity.live.yaml
+configs/risk_limits.local.yaml
+configs/risk_limits.live.yaml
+!configs/*.example.yaml
+
+# 런타임 상태 (Runtime state — 킬 스위치 포함)
+runtime/
+!runtime/.gitkeep
+
+
+# ============================================================
+# 데이터 / DB (Data & DB)
+# ============================================================
+# 시장 데이터 (Market data — 외부 데이터 라이선스 보호)
+data/market/
+data/quotes/
+data/audit/
+data/output/
+
+# 참조 데이터는 commit 가능 (Reference data is committable)
+!data/reference/
+
+# 데이터베이스 파일 (Database files)
+*.sqlite
+*.sqlite3
+*.db
+*.duckdb
+*.parquet
+*.feather
+
+# 캐시 (Cache)
+.cache/
+*.cache
+
+
+# ============================================================
+# 로그 (Logs)
+# ============================================================
+logs/
+*.log
+*.log.*
+
+
+# ============================================================
+# 보고서 산출물 (Report Outputs)
+# ============================================================
+# 잔고/포지션 정보 포함 가능 — never commit
+reports/output/
+*.session.json
+*.report.pdf
+*.report.html
+
+
+# ============================================================
+# Python 표준 (Python Standard)
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 가상환경 (Virtual environments)
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# 배포 / 빌드 (Distribution / Build)
+build/
+dist/
+*.egg-info/
+*.egg
+wheels/
+.eggs/
+
+# 테스트 / 타입 체크 (Test / Type check)
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Jupyter
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+
+
+# ============================================================
+# IDE / 에디터 (IDE / Editor)
+# ============================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+
+# ============================================================
+# 운영체제 (OS)
+# ============================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+
+# ============================================================
+# 노드 / 프론트엔드 (Node / Frontend — Task 48 dashboard)
+# ============================================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json.bak
+
+
+# ============================================================
+# 임시 / 백업 (Temp / Backup)
+# ============================================================
+*.bak
+*.tmp
+*.temp
+*.orig
+.~lock.*
+
+
+# ============================================================
+# 종료 (End of file)
+# ============================================================

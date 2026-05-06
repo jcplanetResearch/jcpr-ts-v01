@@ -14,9 +14,6 @@
   ------------------
   Total           : 46
 """
-# python3 -m pip install pydantic
-# pip install pydantic
-
 import sys
 sys.path.insert(0, '/home/claude')
 
