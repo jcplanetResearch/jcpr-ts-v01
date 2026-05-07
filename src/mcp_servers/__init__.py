@@ -5,42 +5,72 @@ MCP 서버 패키지 (MCP Servers Package)
 JCPR Trading System - jcpr-ts-v01
 
 Task 34 v0.1 — Read-only server (8 tools, stdio, no secrets)
-Task 35 (예정) — Restricted server (write ops with approval gate)
-
-읽기 전용 서버는 LLM Agent에게 read-only 데이터 접근만 제공.
-모든 호출은 Task A1-A3 추적 인프라로 자동 audit.
-
-(Read-only server provides read-only data access to LLM agents.
-All calls auto-audited via Task A1-A3 observability.)
+Task 35 v0.1 — Restricted server (8 write tools + 2 internal, human approval)
 """
 
+from ._approval_store import (
+    ACTION_CANCEL_ORDER,
+    ACTION_KILL_SWITCH,
+    ACTION_SET_CAPACITY,
+    ACTION_SUBMIT_ORDER,
+    ALL_STATUSES,
+    ALLOWED_ACTIONS,
+    STATUS_APPROVED,
+    STATUS_CANCELLED,
+    STATUS_EXECUTED,
+    STATUS_EXPIRED,
+    STATUS_PENDING,
+    STATUS_REJECTED,
+    ApprovalNotFound,
+    ApprovalRecord,
+    ApprovalStateError,
+    ApprovalStore,
+    ApprovalStoreError,
+    SelfApprovalError,
+    generate_approval_id,
+)
 from ._config import (
+    ENV_ALLOW_LIVE,
+    ENV_APPROVAL_DB,
     ENV_AUDIT_DIR,
     ENV_OHLCV_DB,
+    ENV_OPERATOR_ID,
     ENV_POSITIONS_DB,
     ENV_QUOTE_DB,
     ENV_RISK_AUDIT,
     ENV_SESSION_ID,
     ENV_STRATEGY_REGISTRY,
     ReadOnlyServerConfig,
+    RestrictedServerConfig,
     load_config_from_env,
+    load_restricted_config_from_env,
 )
-from .readonly_server import build_server
+from .readonly_server import build_server as build_readonly_server
+from .restricted_server import build_server as build_restricted_server
+
+# 하위 호환: Task 34 build_server는 readonly
+build_server = build_readonly_server
 
 __all__ = [
-    # 빌더
     "build_server",
-    # 설정
+    "build_readonly_server",
+    "build_restricted_server",
     "ReadOnlyServerConfig",
+    "RestrictedServerConfig",
     "load_config_from_env",
-    # 환경변수 키 (외부 참조용)
-    "ENV_AUDIT_DIR",
-    "ENV_POSITIONS_DB",
-    "ENV_OHLCV_DB",
-    "ENV_QUOTE_DB",
-    "ENV_RISK_AUDIT",
-    "ENV_STRATEGY_REGISTRY",
-    "ENV_SESSION_ID",
+    "load_restricted_config_from_env",
+    "ENV_AUDIT_DIR", "ENV_POSITIONS_DB", "ENV_OHLCV_DB", "ENV_QUOTE_DB",
+    "ENV_RISK_AUDIT", "ENV_STRATEGY_REGISTRY", "ENV_SESSION_ID",
+    "ENV_APPROVAL_DB", "ENV_ALLOW_LIVE", "ENV_OPERATOR_ID",
+    "ApprovalStore", "ApprovalRecord",
+    "ApprovalStoreError", "ApprovalNotFound", "ApprovalStateError",
+    "SelfApprovalError", "generate_approval_id",
+    "STATUS_PENDING", "STATUS_APPROVED", "STATUS_REJECTED",
+    "STATUS_EXECUTED", "STATUS_EXPIRED", "STATUS_CANCELLED",
+    "ALL_STATUSES",
+    "ACTION_SUBMIT_ORDER", "ACTION_CANCEL_ORDER",
+    "ACTION_SET_CAPACITY", "ACTION_KILL_SWITCH",
+    "ALLOWED_ACTIONS",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

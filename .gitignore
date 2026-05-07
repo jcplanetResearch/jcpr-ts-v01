@@ -44,3 +44,4 @@ venv/
 .DS_Store
 Thumbs.db
 configs/strategy_registry.yaml
+data/approvals*.sqlite*
