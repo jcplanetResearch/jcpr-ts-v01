@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MarketAnalysis",
+  "description": "Market analyst agent response — used by Task 37 market_agent.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary_ko", "findings"],
+  "properties": {
+    "summary_ko": {
+      "type": "string",
+      "description": "1-3 sentence Korean summary",
+      "minLength": 1,
+      "maxLength": 1500
+    },
+    "findings": {
+      "type": "array",
+      "description": "Key observations with sources",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["statement", "source"],
+        "properties": {
+          "statement": {"type": "string", "maxLength": 1000},
+          "source": {
+            "type": "string",
+            "enum": [
+              "get_market_status", "get_positions", "get_pnl_snapshot",
+              "get_recent_fills", "get_rejection_summary",
+              "get_portfolio_risk", "get_strategy_registry", "get_trace",
+              "operator_input", "computed"
+            ]
+          },
+          "value": {"type": ["string", "number", "boolean", "null"]},
+          "confidence": {"type": "string", "enum": ["high", "medium", "low"]}
+        }
+      },
+      "maxItems": 30
+    },
+    "next_steps": {
+      "type": "array",
+      "description": "Optional recommended actions",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["action", "rationale"],
+        "properties": {
+          "action": {"type": "string", "maxLength": 300},
+          "rationale": {"type": "string", "maxLength": 500},
+          "requires_approval": {"type": "boolean"}
+        }
+      },
+      "maxItems": 10
+    },
+    "uncertainties": {
+      "type": "array",
+      "description": "Known unknowns or data gaps",
+      "items": {"type": "string", "maxLength": 300},
+      "maxItems": 10
+    }
+  }
+}

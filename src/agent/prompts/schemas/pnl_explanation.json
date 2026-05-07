@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PnLExplanation",
+  "description": "P&L explainer agent response — used by Task 39 pnl_agent.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "summary_ko",
+    "total_pnl_krw",
+    "realized_pnl_krw",
+    "unrealized_pnl_krw"
+  ],
+  "properties": {
+    "summary_ko": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1500
+    },
+    "total_pnl_krw": {
+      "type": "string",
+      "description": "Decimal-string KRW (e.g. '4100000.50')"
+    },
+    "realized_pnl_krw": {"type": "string"},
+    "unrealized_pnl_krw": {"type": "string"},
+    "fees_and_slippage_krw": {"type": "string"},
+    "total_pnl_pct": {
+      "type": "string",
+      "description": "Decimal pct (e.g. '0.041' = 4.1%)"
+    },
+    "by_strategy": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["strategy_id", "pnl_krw"],
+        "properties": {
+          "strategy_id": {"type": "string"},
+          "pnl_krw": {"type": "string"},
+          "contribution_pct": {"type": "string"},
+          "fill_count": {"type": "integer", "minimum": 0}
+        }
+      },
+      "maxItems": 50
+    },
+    "by_symbol": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["symbol", "pnl_krw"],
+        "properties": {
+          "symbol": {"type": "string"},
+          "pnl_krw": {"type": "string"},
+          "contribution_pct": {"type": "string"},
+          "realized_krw": {"type": "string"},
+          "unrealized_krw": {"type": "string"}
+        }
+      },
+      "maxItems": 100
+    },
+    "top_winners": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["label", "pnl_krw"],
+        "properties": {
+          "label": {"type": "string"},
+          "kind": {"type": "string", "enum": ["symbol", "strategy"]},
+          "pnl_krw": {"type": "string"}
+        }
+      },
+      "maxItems": 5
+    },
+    "top_losers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["label", "pnl_krw"],
+        "properties": {
+          "label": {"type": "string"},
+          "kind": {"type": "string", "enum": ["symbol", "strategy"]},
+          "pnl_krw": {"type": "string"}
+        }
+      },
+      "maxItems": 5
+    },
+    "notes": {
+      "type": "array",
+      "items": {"type": "string", "maxLength": 500},
+      "maxItems": 10
+    },
+    "reconciliation_ok": {
+      "type": "boolean",
+      "description": "True if realized + unrealized + cash ≈ equity"
+    }
+  }
+}

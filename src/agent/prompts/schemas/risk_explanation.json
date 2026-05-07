@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RiskExplanation",
+  "description": "Risk explainer agent response — used by Task 38 risk_agent.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary_ko", "severity", "evidence"],
+  "properties": {
+    "summary_ko": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1500
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["ok", "warning", "critical"]
+    },
+    "breakdown": {
+      "type": "array",
+      "description": "Risk factors broken down",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["factor", "value"],
+        "properties": {
+          "factor": {
+            "type": "string",
+            "enum": [
+              "sector_concentration", "single_name_concentration",
+              "hhi", "kill_switch_state", "rejected_orders",
+              "leverage", "exposure_limit", "drawdown",
+              "open_positions_count", "position_cost_basis",
+              "other"
+            ]
+          },
+          "value": {"type": ["string", "number"]},
+          "limit": {"type": ["string", "number", "null"]},
+          "breach": {"type": "boolean"},
+          "description_ko": {"type": "string", "maxLength": 500}
+        }
+      },
+      "maxItems": 30
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "finding"],
+        "properties": {
+          "source": {
+            "type": "string",
+            "enum": [
+              "get_portfolio_risk", "get_rejection_summary",
+              "get_positions", "get_trace", "get_strategy_registry",
+              "computed", "operator_input"
+            ]
+          },
+          "finding": {"type": "string", "maxLength": 1000},
+          "trace_id": {"type": ["string", "null"]}
+        }
+      },
+      "maxItems": 30
+    },
+    "recommended_actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["action", "rationale"],
+        "properties": {
+          "action": {"type": "string", "maxLength": 300},
+          "rationale": {"type": "string", "maxLength": 500},
+          "requires_approval": {"type": "boolean"},
+          "consequence_if_skipped": {"type": "string", "maxLength": 500}
+        }
+      },
+      "maxItems": 10
+    }
+  }
+}
