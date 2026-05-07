@@ -1,17 +1,17 @@
 """
-다음 세션 자본 추천 (Next-Session Capacity Recommender)
+다음 세션 자본 추천 (Next Session Capacity Recommender)
 ========================================================
 
 JCPR Trading System - jcpr-ts-v01
-Task 49 v0.1 — Final Output #12
+Task 49 v0.2 — Final Output #12
 
 5단계 시그널 강도 기반 보수적 추천.
-(5-stage signal-strength based conservative recommendation.)
+(5-stage signal-strength-based conservative recommendation.)
 
-원칙:
-- 보수적 (conservative) — 위험 신호 시 capacity 축소
-- 운영자 결정의 참고 자료일 뿐 — 강제 아님
-- 모든 입력은 read-only (audit log + 분석 결과)
+원칙 (Principles):
+    - 안전 우선 (safety first) — 문제 발생 시 capacity 축소
+    - 운영자 결정 보조 (advisory) — 자동 실행 안 함
+    - 임계값 외부 주입 가능 (thresholds injectable for testing)
 """
 
 from __future__ import annotations
@@ -21,172 +21,187 @@ from decimal import Decimal
 from typing import Optional
 
 
+# ─────────────────────────────────────────────────
+# 임계값 (Thresholds — injectable)
+# ─────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class CapacityThresholds:
+    """추천 임계값 — 외부 주입 가능."""
+    # 신호 카운트 임계값
+    rejection_rate_high: float = 0.30      # >30% 거부율 → 신호
+    rejection_rate_critical: float = 0.50  # >50% 거부율 → 강한 신호
+    exception_count_warn: int = 1          # 1건 이상 예외 → 신호
+    exception_count_critical: int = 5      # 5건 이상 → 강한 신호
+    pnl_loss_pct_warn: float = -0.02       # -2% 손실 → 신호
+    pnl_loss_pct_critical: float = -0.05   # -5% 손실 → 강한 신호
+
+    # capacity 조정 비율 (배수)
+    multiplier_increase: Decimal = Decimal("1.10")    # +10% (긍정 시)
+    multiplier_hold: Decimal = Decimal("1.00")        # 유지
+    multiplier_reduce_mild: Decimal = Decimal("0.80")  # -20%
+    multiplier_reduce_strong: Decimal = Decimal("0.50")  # -50%
+    multiplier_halt: Decimal = Decimal("0.00")         # 중단
+
+
+DEFAULT_THRESHOLDS = CapacityThresholds()
+
+
+# ─────────────────────────────────────────────────
+# 추천 결과 (Recommendation Result)
+# ─────────────────────────────────────────────────
+
 @dataclass(frozen=True)
 class CapacityRecommendation:
-    """다음 세션 자본 추천 결과 — Final Output #12."""
-    current_capital_krw: Decimal
-    recommend_pct: Decimal              # 0.50 ~ 1.00
-    recommended_capacity_krw: Decimal
-    risk_signals: int
-    risk_signal_breakdown: dict[str, int] = field(default_factory=dict)
-    reasoning: list[str] = field(default_factory=list)
-    severity: str = "ok"                # "ok" / "low" / "moderate" / "high" / "critical"
+    """다음 세션 자본 추천 결과."""
+    current_capital_krw: str           # Decimal as string
+    recommended_capital_krw: str       # Decimal as string
+    multiplier: str                    # Decimal as string
+    stage: str                         # "increase", "hold", "reduce_mild", "reduce_strong", "halt"
+    risk_signals: int                  # 감지된 신호 수
+    signal_details: list[str] = field(default_factory=list)
+    reasoning: str = ""
 
     def to_dict(self) -> dict:
         return {
-            "current_capital_krw": str(self.current_capital_krw),
-            "recommend_pct": str(self.recommend_pct),
-            "recommended_capacity_krw": str(self.recommended_capacity_krw),
+            "current_capital_krw": self.current_capital_krw,
+            "recommended_capital_krw": self.recommended_capital_krw,
+            "multiplier": self.multiplier,
+            "stage": self.stage,
             "risk_signals": self.risk_signals,
-            "risk_signal_breakdown": dict(self.risk_signal_breakdown),
-            "severity": self.severity,
-            "reasoning": list(self.reasoning),
+            "signal_details": self.signal_details,
+            "reasoning": self.reasoning,
         }
 
+
+# ─────────────────────────────────────────────────
+# 5단계 추천 알고리즘 (5-Stage Algorithm)
+# ─────────────────────────────────────────────────
 
 def recommend_next_capacity(
     *,
     starting_capital_krw: Decimal,
     realized_pnl_krw: Decimal,
-    rejected_orders_count: int,
-    rejection_rate: float,
-    exceptions_count: int,
-    reconciliation_severity: str = "ok",   # "ok" / "minor" / "major" / "unknown"
+    unrealized_pnl_krw: Decimal,
+    rejection_rate: float = 0.0,
+    exception_count: int = 0,
+    reconciliation_severity: str = "ok",   # "ok" / "minor" / "major"
     portfolio_risk_warnings: int = 0,
-    rejection_threshold_count: int = 50,
-    rejection_threshold_rate: float = 0.30,
+    thresholds: Optional[CapacityThresholds] = None,
 ) -> CapacityRecommendation:
     """
-    5단계 자본 추천.
+    5단계 신호 기반 다음 세션 자본 추천.
 
-    Signal Sources (each contributes weighted points):
-        1. Reconciliation severity:
-           - major: +2 (severe — broker/internal mismatch)
-           - minor: +1 (avg_price drift only)
-           - unknown: +1 (data missing — conservative)
-           - ok: 0
+    단계 (Stages):
+        1. halt          — 거래 중단 권고 (multiplier=0)
+        2. reduce_strong — 50% 축소
+        3. reduce_mild   — 20% 축소
+        4. hold          — 유지
+        5. increase      — 10% 증액 (긍정 신호 + 무문제 시)
 
-        2. Exception count: > 0 → +1
-
-        3. Rejection volume:
-           - rejected_count > threshold (default 50): +1
-           - rejection_rate > threshold (default 30%): +1 (independent)
-
-        4. Portfolio risk warnings: > 0 → +1
-
-    Stage mapping (signal_total → capacity_pct):
-        0 signals: 100% (정상 — maintain)
-        1 signal:  90%  (주의 — slight reduction)
-        2 signals: 75%  (경고 — moderate reduction)
-        3 signals: 60%  (위험 — substantial reduction)
-        4+ signals: 50% (심각 — minimum capacity / forced review)
+    Returns:
+        CapacityRecommendation
     """
-    if starting_capital_krw < 0:
-        raise ValueError(f"starting_capital_krw 음수 불가: {starting_capital_krw}")
-    if rejected_orders_count < 0 or exceptions_count < 0 or portfolio_risk_warnings < 0:
-        raise ValueError("count 인자는 음수 불가")
-    if not (0.0 <= rejection_rate <= 1.0):
-        raise ValueError(f"rejection_rate는 [0, 1]: {rejection_rate}")
+    th = thresholds or DEFAULT_THRESHOLDS
 
-    # 누적 자본 = 시작 + 실현 P&L (미실현은 제외 — 보수적)
-    current_capital = starting_capital_krw + realized_pnl_krw
-    if current_capital < 0:
-        current_capital = Decimal("0")
+    starting = Decimal(str(starting_capital_krw))
+    realized = Decimal(str(realized_pnl_krw))
+    unrealized = Decimal(str(unrealized_pnl_krw))
+    total_pnl = realized + unrealized
+    pnl_pct = float(total_pnl / starting) if starting > 0 else 0.0
 
-    # 신호 누적
-    signals = 0
-    breakdown: dict[str, int] = {}
-    reasoning: list[str] = []
+    signals: list[str] = []
+    severity_score = 0  # 0=ok, 1=mild, 2=strong, 3=halt
 
-    # 1) Reconciliation
+    # ─── 신호 1: 거부율 ────────────────────────
+    if rejection_rate >= th.rejection_rate_critical:
+        signals.append(
+            f"거부율 {rejection_rate:.1%} (critical, "
+            f">={th.rejection_rate_critical:.0%})"
+        )
+        severity_score = max(severity_score, 2)
+    elif rejection_rate >= th.rejection_rate_high:
+        signals.append(
+            f"거부율 {rejection_rate:.1%} (high, "
+            f">={th.rejection_rate_high:.0%})"
+        )
+        severity_score = max(severity_score, 1)
+
+    # ─── 신호 2: 예외 ──────────────────────────
+    if exception_count >= th.exception_count_critical:
+        signals.append(
+            f"예외 {exception_count}건 (critical, "
+            f">={th.exception_count_critical})"
+        )
+        severity_score = max(severity_score, 2)
+    elif exception_count >= th.exception_count_warn:
+        signals.append(
+            f"예외 {exception_count}건 (warning, "
+            f">={th.exception_count_warn})"
+        )
+        severity_score = max(severity_score, 1)
+
+    # ─── 신호 3: P&L 손실 ──────────────────────
+    if pnl_pct <= th.pnl_loss_pct_critical:
+        signals.append(
+            f"손실 {pnl_pct:.1%} (critical, "
+            f"<={th.pnl_loss_pct_critical:.0%})"
+        )
+        severity_score = max(severity_score, 2)
+    elif pnl_pct <= th.pnl_loss_pct_warn:
+        signals.append(
+            f"손실 {pnl_pct:.1%} (warning, "
+            f"<={th.pnl_loss_pct_warn:.0%})"
+        )
+        severity_score = max(severity_score, 1)
+
+    # ─── 신호 4: 정합성 (Reconciliation) ───────
     if reconciliation_severity == "major":
-        signals += 2
-        breakdown["reconciliation_major"] = 2
-        reasoning.append(
-            "정합성(reconciliation) major mismatch 감지 — "
-            "브로커-내부 원장 불일치 (broker-ledger discrepancy)"
-        )
+        signals.append("정합성 불일치 major — 즉시 점검 필요")
+        severity_score = max(severity_score, 3)  # halt
     elif reconciliation_severity == "minor":
-        signals += 1
-        breakdown["reconciliation_minor"] = 1
-        reasoning.append(
-            "정합성 minor mismatch — 평균가 차이 (avg_price drift)"
-        )
-    elif reconciliation_severity == "unknown":
-        signals += 1
-        breakdown["reconciliation_unknown"] = 1
-        reasoning.append(
-            "정합성 점검 미실행 — 데이터 부재 (reconciliation not performed)"
-        )
+        signals.append("정합성 불일치 minor")
+        severity_score = max(severity_score, 1)
 
-    # 2) 예외
-    if exceptions_count > 0:
-        signals += 1
-        breakdown["exceptions"] = 1
-        reasoning.append(
-            f"실행 중 예외 {exceptions_count}건 발생 (exceptions during execution)"
-        )
+    # ─── 신호 5: 포트폴리오 리스크 경고 ────────
+    if portfolio_risk_warnings >= 3:
+        signals.append(f"포트폴리오 경고 {portfolio_risk_warnings}건 (high)")
+        severity_score = max(severity_score, 2)
+    elif portfolio_risk_warnings >= 1:
+        signals.append(f"포트폴리오 경고 {portfolio_risk_warnings}건")
+        severity_score = max(severity_score, 1)
 
-    # 3) 거부 폭증 — 횟수
-    if rejected_orders_count > rejection_threshold_count:
-        signals += 1
-        breakdown["rejection_volume"] = 1
-        reasoning.append(
-            f"거부된 주문 {rejected_orders_count}건 > 임계값 {rejection_threshold_count} "
-            f"(high rejection volume)"
-        )
+    # ─── 단계 결정 ─────────────────────────────
+    if severity_score >= 3:
+        stage = "halt"
+        multiplier = th.multiplier_halt
+        reasoning = "거래 중단 권고 — 정합성 major 불일치 또는 다중 critical 신호."
+    elif severity_score == 2:
+        stage = "reduce_strong"
+        multiplier = th.multiplier_reduce_strong
+        reasoning = "강한 축소 권고 — critical 신호 감지."
+    elif severity_score == 1:
+        stage = "reduce_mild"
+        multiplier = th.multiplier_reduce_mild
+        reasoning = "약한 축소 권고 — warning 신호 감지."
+    elif total_pnl > 0 and pnl_pct >= 0.02:
+        # 신호 없음 + 2% 이상 수익 → 소폭 증액
+        stage = "increase"
+        multiplier = th.multiplier_increase
+        reasoning = "소폭 증액 가능 — 신호 없음 + 안정적 수익."
+    else:
+        stage = "hold"
+        multiplier = th.multiplier_hold
+        reasoning = "현재 capacity 유지 권고."
 
-    # 3-2) 거부율
-    if rejection_rate > rejection_threshold_rate:
-        signals += 1
-        breakdown["rejection_rate"] = 1
-        reasoning.append(
-            f"거부율 {rejection_rate:.1%} > 임계값 {rejection_threshold_rate:.1%} "
-            f"(high rejection rate)"
-        )
-
-    # 4) 포트폴리오 위험 경고
-    if portfolio_risk_warnings > 0:
-        signals += 1
-        breakdown["portfolio_warnings"] = 1
-        reasoning.append(
-            f"포트폴리오 리스크 경고 {portfolio_risk_warnings}건 "
-            f"(portfolio risk warnings)"
-        )
-
-    # 5단계 매핑
-    if signals == 0:
-        pct = Decimal("1.00")
-        severity = "ok"
-        reasoning.insert(0, "정상 — 위험 신호 없음 (no risk signals)")
-    elif signals == 1:
-        pct = Decimal("0.90")
-        severity = "low"
-        reasoning.insert(0, "주의 — 1개 위험 신호, 90% 권장")
-    elif signals == 2:
-        pct = Decimal("0.75")
-        severity = "moderate"
-        reasoning.insert(0, "경고 — 2개 위험 신호, 75% 권장")
-    elif signals == 3:
-        pct = Decimal("0.60")
-        severity = "high"
-        reasoning.insert(0, "위험 — 3개 위험 신호, 60% 권장")
-    else:  # 4+
-        pct = Decimal("0.50")
-        severity = "critical"
-        reasoning.insert(
-            0,
-            f"심각 — {signals}개 위험 신호, 50% 권장 (운영자 검토 필수)"
-        )
-
-    recommended = current_capital * pct
+    recommended = (starting * multiplier).quantize(Decimal("1"))
 
     return CapacityRecommendation(
-        current_capital_krw=current_capital,
-        recommend_pct=pct,
-        recommended_capacity_krw=recommended,
-        risk_signals=signals,
-        risk_signal_breakdown=breakdown,
+        current_capital_krw=str(starting),
+        recommended_capital_krw=str(recommended),
+        multiplier=str(multiplier),
+        stage=stage,
+        risk_signals=len(signals),
+        signal_details=signals,
         reasoning=reasoning,
-        severity=severity,
     )
