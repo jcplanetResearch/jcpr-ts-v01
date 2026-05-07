@@ -30,6 +30,14 @@ Task 45 v0.1 — Multi-Strategy Registry
     - 동적 클래스 로더 (선택적, 화이트리스트 검증)
 """
 
+from .capital_allocator import (
+    ALLOWED_MODES,
+    MODE_LIVE,
+    MODE_PAPER,
+    CapitalAllocation,
+    StrategyAllocation,
+    allocate_capital,
+)
 from .loader import (
     RegistryLoadError,
     load_registry,
@@ -45,18 +53,25 @@ from .schema import (
 )
 
 __all__ = [
-    # 모델
+    # 모델 (Task 45)
     "StrategyEntry",
     "RegistryFile",
     "StrategyRegistry",
-    # 로더
+    # 로더 (Task 45)
     "load_registry",
     "load_registry_from_string",
     "RegistryLoadError",
-    # 상수 (외부 참조용)
+    # 상수 (Task 45)
     "ALLOWED_MODULE_PREFIXES",
     "ALLOWED_TIMEFRAMES",
     "ALLOWED_SIGNAL_CATEGORIES",
+    # 자본 할당 (Task 46)
+    "allocate_capital",
+    "CapitalAllocation",
+    "StrategyAllocation",
+    "MODE_LIVE",
+    "MODE_PAPER",
+    "ALLOWED_MODES",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"  # Task 46 추가
