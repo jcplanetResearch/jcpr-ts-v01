@@ -1,0 +1,118 @@
+# ─────────────────────────────────────────────────────────
+# JCPR Trading System - 전략 레지스트리 (Strategy Registry)
+# ─────────────────────────────────────────────────────────
+# Task 45 v0.1 — Multi-Strategy Registry
+#
+# 본 파일은 템플릿 (.example.yaml) 입니다.
+# (This is a template — copy and customize.)
+#
+# 사용 방법 (Usage):
+#   1. 이 파일을 strategy_registry.yaml 로 복사
+#      (Copy this file to strategy_registry.yaml)
+#   2. .gitignore 에 strategy_registry.yaml 등록 (실제 운영값 보호)
+#   3. enabled / paper_only / capital_weight 등 환경에 맞게 조정
+#
+# 보안 원칙 (Security Principles):
+#   - parameters 에 시크릿 (api_key, password, token 등) 금지
+#   - module_path 는 src.signals.strategies.* 만 허용
+#   - 실제 운영값은 GitHub 푸시 금지 (.example.yaml 만 푸시)
+#
+# 검증 (Validation):
+#   python scripts/validate_strategy_registry.py configs/strategy_registry.yaml
+# ─────────────────────────────────────────────────────────
+
+version: "1.0"
+
+strategies:
+  # ─── 활성·라이브 가능 전략 (Active + Live-eligible) ───
+  - strategy_id: momentum_v1
+    module_path: src.signals.strategies.momentum_v1
+    class_name: MomentumV1
+    version: "1.0.0"
+    enabled: true
+    paper_only: false        # 라이브 운영 가능
+
+    # 자본 할당 (Task 46이 사용)
+    capital_weight: 0.6      # 60% 가중치
+    max_capital_pct: 0.3     # 단일 전략 최대 30%
+
+    # 운영 메타
+    timeframe: "1d"
+    universe:
+      - "005930"             # 삼성전자 (Samsung Electronics)
+      - "000660"             # SK하이닉스 (SK Hynix)
+      - "035420"             # NAVER
+
+    signal_categories:
+      - ENTRY
+      - EXIT
+
+    # 전략별 파라미터 (시크릿 금지 — 환경변수로 전달)
+    parameters:
+      lookback: 20
+      z_score_threshold: 1.0
+      use_volume_confirm: true
+
+    activated_at: "2026-05-07"
+    notes: "First production strategy — daily momentum on KRX large-caps"
+
+  # ─── 비활성·페이퍼 전용 전략 (Disabled + Paper-only) ───
+  - strategy_id: mean_rev_v1
+    module_path: src.signals.strategies.mean_rev_v1
+    class_name: MeanReversionV1
+    version: "0.1.0"
+    enabled: false           # 비활성 — 등록만 됨
+    paper_only: true         # 활성화 시에도 페이퍼만
+
+    capital_weight: 0.0      # 활성화 시 가중치 부여
+    max_capital_pct: 0.1
+
+    timeframe: "1h"
+    universe: []             # 빈 리스트 = 추후 결정
+
+    signal_categories:
+      - ENTRY
+      - EXIT
+      - REBALANCE
+
+    parameters:
+      bb_window: 20
+      bb_std_multiplier: 2.0
+
+    activated_at: null
+    notes: "Under development — paper trading first"
+
+  # ─── 리스크 축소 전용 전략 (Risk-reduce only) ───
+  - strategy_id: stop_loss_v1
+    module_path: src.signals.strategies.stop_loss_v1
+    class_name: StopLossV1
+    version: "1.0.0"
+    enabled: true
+    paper_only: false
+
+    capital_weight: 0.0      # 자본 할당 없음 (보유 포지션에만 작동)
+    max_capital_pct: 0.0
+
+    timeframe: "5m"          # 빠른 반응
+    universe: []             # 모든 보유 종목
+
+    signal_categories:
+      - STOP_LOSS
+      - RISK_REDUCE
+
+    parameters:
+      stop_loss_pct: 0.05     # -5% 손실 시 청산
+      trailing_stop_pct: 0.03 # 고점 대비 -3% 트레일링
+
+    activated_at: "2026-05-07"
+    notes: "Risk management overlay — not capital-allocated"
+
+# ─────────────────────────────────────────────────────────
+# 자본 가중치 합 (Capital weight sum) 검증
+# ─────────────────────────────────────────────────────────
+# 활성 전략의 capital_weight 합:
+#   momentum_v1 (0.6) + mean_rev_v1 (0.0, disabled) + stop_loss_v1 (0.0)
+#   = 0.6  ≤ 1.0  ✅
+#
+# 나머지 0.4 는 현금 보유 (cash buffer) 또는 미할당
+# ─────────────────────────────────────────────────────────

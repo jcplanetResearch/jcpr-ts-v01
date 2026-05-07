@@ -43,3 +43,4 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+configs/strategy_registry.yaml
