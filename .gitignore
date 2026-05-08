@@ -1,47 +1,69 @@
-.DS_Store
-# === 보안 핵심 (CRITICAL — Security) ===
-env
+# =============================================================================
+# JCPR Trading System — .gitignore
+# =============================================================================
+# CRITICAL: .env must NEVER be committed.
+# =============================================================================
+
+# Secrets — NEVER COMMIT
 .env
-.env.*
-!.env.example
-secrets/
-*.pem
+.env.local
+.env.*.local
+gitignore
 *.key
+*.pem
 *.p12
 credentials.json
-configs/live_limited.yaml          # 실제 라이브 설정 (예제만 커밋)
-configs/capacity.local.yaml        # 실제 자본 설정
-runtime/                            # 킬 스위치, 런타임 상태
+secrets.yaml
+secrets.yml
 
-# === 데이터·DB (Data & DB) ===
-data/market/
-data/audit/
-*.sqlite
-*.db
-*.duckdb
+# Token caches (contain access tokens)
+runtime/
+.kis_token_*.json
 
-# === 로그 (Logs) ===
-logs/
-*.log
-
-# === 보고서 (Reports — 잠재 PII/잔고 포함) ===
-reports/output/
-*.session.json
-
-# === 파이썬 표준 (Python Standard) ===
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
 *.so
-.venv/
-venv/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# === IDE / OS ===
-.vscode/
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDE
 .idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
 .DS_Store
-Thumbs.db
-configs/strategy_registry.yaml
-data/approvals*.sqlite*
+.AppleDouble
+.LSOverride
+
+# Audit / data (contains PII — do not commit)
+data/
+logs/
+audit/
+
+# Backup folders created by sync scripts
+.backup_task*/
+.venv/
