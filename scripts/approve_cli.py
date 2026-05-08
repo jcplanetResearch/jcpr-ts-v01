@@ -1,208 +1,288 @@
 #!/usr/bin/env python3
+"""Task 40 — Operator approval CLI.
+
+Lists pending proposals, shows details, allows approve/reject decisions.
+
+CRITICAL SAFETY RULES:
+    1. Operator's actor id MUST differ from the proposal's requested_by.
+       Self-approval is blocked at the store level.
+    2. Approval gives green light but does NOT execute. ExecutionGateway
+       handles execution after approval.
+    3. Each decision requires explicit confirmation (y/N) and reason text.
+    4. Never run this script as the same user that runs trading agents.
+
+Usage:
+    # List pending proposals
+    python scripts/approve_cli.py list
+
+    # View a specific proposal
+    python scripts/approve_cli.py show ap-uuid
+
+    # Approve a proposal (interactive)
+    python scripts/approve_cli.py approve ap-uuid --actor operator-jcpr
+
+    # Reject with reason
+    python scripts/approve_cli.py reject ap-uuid --actor operator-jcpr \\
+        --reason "위험도 초과 — 포지션 한도 도달"
+
+Exit codes:
+    0  Success
+    1  Operation failed
+    2  Invalid arguments
+    3  Self-approval blocked
 """
-운영자 승인 CLI (Operator Approve CLI)
-=======================================
-
-JCPR Trading System - jcpr-ts-v01
-Task 35 v0.1
-
-운영자가 pending 승인을 보고 approve/reject.
-(Operator inspects pending approvals and decides.)
-
-사용 (Usage):
-    # 모든 pending 조회
-    python scripts/approve_cli.py --approval-db data/approvals.sqlite --list
-
-    # 특정 ID 상세 조회
-    python scripts/approve_cli.py --approval-db data/approvals.sqlite \\
-        --approval-id apv-20260507-a1b2c3d4 --show
-
-    # 승인
-    python scripts/approve_cli.py --approval-db data/approvals.sqlite \\
-        --approval-id apv-20260507-a1b2c3d4 --approve \\
-        --decided-by alice --reason "verified"
-
-    # 거부
-    python scripts/approve_cli.py --approval-db data/approvals.sqlite \\
-        --approval-id apv-20260507-a1b2c3d4 --reject \\
-        --decided-by alice --reason "size too large"
-
-    # JSON 출력
-    python scripts/approve_cli.py --approval-db data/approvals.sqlite \\
-        --list --json
-
-CLI는 audit log를 작성하지 않음 — store에서 상태만 변경.
-audit는 다음번 MCP server에서 조회 시 자동 반영.
-"""
-
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent
-if str(_REPO) not in sys.path:
-    sys.path.insert(0, str(_REPO))
-
-from src.mcp_servers import (  # noqa: E402
-    ApprovalNotFound,
-    ApprovalStateError,
-    ApprovalStore,
-    ApprovalStoreError,
-    SelfApprovalError,
-    STATUS_PENDING,
-)
+sys.path.insert(0, str(_REPO))
 
 
-def _format_record(rec) -> str:
-    """승인 레코드 한 줄 요약."""
-    age = ""
+def _format_proposal(p) -> str:
+    """Render proposal as human-readable text."""
+    lines = []
+    lines.append("=" * 70)
+    lines.append(f"Approval ID:   {p.approval_id}")
+    lines.append(f"Action Type:   {p.action_type}")
+    lines.append(f"State:         {p.state.value}")
+    lines.append(f"Requested By:  {p.requested_by}")
+    lines.append(f"Proposed:      {p.proposed_at_utc.isoformat()}")
+    lines.append(f"Expires:       {p.expires_at_utc.isoformat()}")
+    if p.decided_by:
+        lines.append(f"Decided By:    {p.decided_by}")
+        lines.append(f"Decided At:    {p.decided_at_utc.isoformat()}")
+    if p.decision_reason_kr:
+        lines.append(f"Reason:        {p.decision_reason_kr}")
+    lines.append("")
+    lines.append("Payload:")
+    for k, v in dict(p.payload).items():
+        lines.append(f"  {k:<22} {v}")
+    if p.execution_result:
+        lines.append("")
+        lines.append("Execution Result:")
+        for k, v in dict(p.execution_result).items():
+            lines.append(f"  {k:<22} {v}")
+    lines.append("=" * 70)
+    return "\n".join(lines)
+
+
+def _list_pending(store) -> int:
+    pending = store.list_pending(limit=50)
+    if not pending:
+        print("(no pending proposals)")
+        return 0
+    print(f"Pending proposals ({len(pending)}):")
+    print("-" * 90)
+    print(f"{'Approval ID':<42} {'State':<10} {'Action':<18} {'Requested By':<15}")
+    print("-" * 90)
+    for p in pending:
+        print(f"{p.approval_id:<42} {p.state.value:<10} "
+              f"{p.action_type:<18} {p.requested_by:<15}")
+    print("-" * 90)
+    return 0
+
+
+def _show(store, approval_id: str) -> int:
     try:
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc)
-        if rec.status == STATUS_PENDING:
-            remaining = (rec.expires_at_utc - now).total_seconds()
-            age = f" (만료 {int(remaining)}초)"
-    except Exception:  # noqa: BLE001
-        pass
-    return (
-        f"{rec.approval_id} | {rec.status:10s} | "
-        f"{rec.action_type:15s} | by={rec.requested_by:15s}"
-        f"{age}"
+        p = store.get(approval_id)
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    print(_format_proposal(p))
+    return 0
+
+
+def _confirm(prompt: str) -> bool:
+    """Interactive y/N confirmation. Treats EOF/Ctrl-D as no."""
+    try:
+        response = input(f"{prompt} [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return response in ("y", "yes")
+
+
+def _approve(store, approval_id: str, actor: str,
+             reason: str | None, no_confirm: bool) -> int:
+    from src.execution._approval_state import (
+        ApprovalState,
+        SelfApprovalError,
+        StateTransitionError,
     )
 
-
-def _print_full(rec) -> None:
-    """승인 레코드 상세 출력."""
-    print(f"━━━ {rec.approval_id} ━━━")
-    print(f"  status:        {rec.status}")
-    print(f"  action_type:   {rec.action_type}")
-    print(f"  requested_by:  {rec.requested_by}")
-    print(f"  requested_at:  {rec.requested_at_utc.isoformat()}")
-    print(f"  expires_at:    {rec.expires_at_utc.isoformat()}")
-    print(f"  paper_mode:    {rec.paper_mode}")
-    print(f"  trace_id:      {rec.trace_id}")
-    print(f"  decided_at:    {rec.decided_at_utc.isoformat() if rec.decided_at_utc else '(pending)'}")
-    print(f"  decided_by:    {rec.decided_by or '-'}")
-    print(f"  decision:      {rec.decision_reason or '-'}")
-    print(f"  payload:")
-    for k, v in rec.payload.items():
-        print(f"    {k}: {v}")
-    if rec.execution_result:
-        print(f"  execution_result:")
-        for k, v in rec.execution_result.items():
-            print(f"    {k}: {v}")
-
-
-def _parse_args(argv: list[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="JCPR Operator Approve CLI (Task 35 v0.1)",
-    )
-    p.add_argument("--approval-db", required=True, help="승인 DB 파일")
-
-    g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument("--list", action="store_true", help="pending 목록")
-    g.add_argument("--show", action="store_true", help="단일 상세 (--approval-id 필요)")
-    g.add_argument("--approve", action="store_true", help="승인")
-    g.add_argument("--reject", action="store_true", help="거부")
-
-    p.add_argument("--approval-id", help="대상 approval_id")
-    p.add_argument("--decided-by", help="결정자 ID (approve/reject)")
-    p.add_argument("--reason", default="", help="결정 사유")
-    p.add_argument("--json", action="store_true", help="JSON 출력")
-    p.add_argument("--limit", type=int, default=50, help="목록 한도")
-    p.add_argument("--all-statuses", action="store_true",
-                   help="--list 시 pending 외 상태 포함")
-    return p.parse_args(argv)
-
-
-def main(argv: list[str] | None = None) -> int:
-    argv = argv if argv is not None else sys.argv[1:]
-    args = _parse_args(argv)
-
-    if not Path(args.approval_db).exists():
-        print(f"❌ approval_db 파일 없음: {args.approval_db}", file=sys.stderr)
-        return 1
-
-    store = ApprovalStore(db_path=args.approval_db)
-
-    # ─── --list ───────────────────────────────
-    if args.list:
-        if args.all_statuses:
-            from src.mcp_servers._approval_store import ALL_STATUSES
-            records = store.list_by_status(list(ALL_STATUSES), limit=args.limit)
-        else:
-            records = store.list_pending(limit=args.limit)
-        if args.json:
-            print(json.dumps(
-                [r.to_dict() for r in records],
-                ensure_ascii=False, indent=2, default=str,
-            ))
-        else:
-            print(f"━━━ Approvals ({len(records)}) ━━━")
-            for r in records:
-                print(_format_record(r))
-        return 0
-
-    # ─── --show ───────────────────────────────
-    if args.show:
-        if not args.approval_id:
-            print("❌ --approval-id required for --show", file=sys.stderr)
-            return 2
-        try:
-            rec = store.get(args.approval_id)
-        except ApprovalNotFound:
-            print(f"❌ Not found: {args.approval_id}", file=sys.stderr)
-            return 1
-        if args.json:
-            print(json.dumps(rec.to_dict(), ensure_ascii=False, indent=2, default=str))
-        else:
-            _print_full(rec)
-        return 0
-
-    # ─── --approve / --reject ─────────────────
-    if not args.approval_id:
-        print("❌ --approval-id required", file=sys.stderr)
-        return 2
-    if not args.decided_by:
-        print("❌ --decided-by required", file=sys.stderr)
-        return 2
-
     try:
-        if args.approve:
-            rec = store.approve(
-                args.approval_id,
-                decided_by=args.decided_by,
-                reason=args.reason,
-            )
-            print(f"✅ Approved: {args.approval_id}")
-        else:  # --reject
-            rec = store.reject(
-                args.approval_id,
-                decided_by=args.decided_by,
-                reason=args.reason,
-            )
-            print(f"❌ Rejected: {args.approval_id}")
-        if args.json:
-            print(json.dumps(rec.to_dict(), ensure_ascii=False, indent=2, default=str))
-        else:
-            _print_full(rec)
-        return 0
-    except ApprovalNotFound:
-        print(f"❌ Not found: {args.approval_id}", file=sys.stderr)
+        p = store.get(approval_id)
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
         return 1
-    except SelfApprovalError as e:
-        print(f"🚨 Self-approval blocked: {e}", file=sys.stderr)
+
+    print(_format_proposal(p))
+    print()
+    print(f"⚠️  You are about to APPROVE this proposal as '{actor}'.")
+    print(f"⚠️  This authorizes the agent to execute the action.")
+    print()
+
+    if p.state != ApprovalState.PROPOSED:
+        print(f"ERROR: cannot approve — state is {p.state.value}",
+              file=sys.stderr)
+        return 1
+
+    if p.requested_by == actor:
+        print("ERROR: self-approval blocked — actor is same as requested_by",
+              file=sys.stderr)
         return 3
-    except ApprovalStateError as e:
-        print(f"❌ State error: {e}", file=sys.stderr)
-        return 4
-    except ApprovalStoreError as e:
-        print(f"❌ Store error: {e}", file=sys.stderr)
-        return 5
+
+    if not no_confirm and not _confirm("Confirm APPROVE?"):
+        print("Aborted.")
+        return 1
+
+    try:
+        result = store.transition(
+            approval_id=approval_id,
+            target_state=ApprovalState.APPROVED,
+            actor=actor,
+            reason_kr=reason,
+        )
+    except SelfApprovalError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 3
+    except StateTransitionError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+
+    print(f"✓ Approved {approval_id} by {actor}")
+    print(f"  State: {result.state.value}")
+    return 0
+
+
+def _reject(store, approval_id: str, actor: str,
+            reason: str, no_confirm: bool) -> int:
+    from src.execution._approval_state import (
+        ApprovalState,
+        SelfApprovalError,
+        StateTransitionError,
+    )
+
+    if not reason:
+        print("ERROR: --reason required for rejection", file=sys.stderr)
+        return 2
+
+    try:
+        p = store.get(approval_id)
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+
+    print(_format_proposal(p))
+    print()
+    print(f"You are about to REJECT this proposal as '{actor}'.")
+    print(f"Reason: {reason}")
+
+    if p.requested_by == actor:
+        print("ERROR: self-rejection blocked", file=sys.stderr)
+        return 3
+
+    if not no_confirm and not _confirm("Confirm REJECT?"):
+        print("Aborted.")
+        return 1
+
+    try:
+        result = store.transition(
+            approval_id=approval_id,
+            target_state=ApprovalState.REJECTED,
+            actor=actor,
+            reason_kr=reason,
+        )
+    except SelfApprovalError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 3
+    except StateTransitionError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+
+    print(f"✗ Rejected {approval_id} by {actor}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="JCPR Trading System — Operator Approval CLI (Task 40)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--db-path",
+        type=str,
+        default=os.environ.get("JCPR_APPROVAL_DB", "./runtime/approvals.db"),
+        help="Path to approval SQLite DB",
+    )
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("list", help="List pending proposals")
+
+    show_p = sub.add_parser("show", help="Show a specific proposal")
+    show_p.add_argument("approval_id")
+
+    approve_p = sub.add_parser("approve", help="Approve a proposal")
+    approve_p.add_argument("approval_id")
+    approve_p.add_argument("--actor", required=True,
+                           help="Operator id (must differ from requested_by)")
+    approve_p.add_argument("--reason", default=None,
+                           help="Optional approval reason in Korean")
+    approve_p.add_argument("--yes", "-y", action="store_true",
+                           dest="no_confirm",
+                           help="Skip interactive confirmation")
+
+    reject_p = sub.add_parser("reject", help="Reject a proposal")
+    reject_p.add_argument("approval_id")
+    reject_p.add_argument("--actor", required=True)
+    reject_p.add_argument("--reason", required=True,
+                          help="Rejection reason (Korean)")
+    reject_p.add_argument("--yes", "-y", action="store_true",
+                          dest="no_confirm")
+
+    args = parser.parse_args()
+
+    try:
+        from src.execution._approval_state import ApprovalStore
+    except ImportError as e:
+        print(f"ERROR: import — {e}", file=sys.stderr)
+        return 2
+
+    db_path = Path(args.db_path)
+    if not db_path.parent.exists():
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        store = ApprovalStore(db_path=db_path)
+    except Exception as e:
+        print(f"ERROR: cannot open DB — {e}", file=sys.stderr)
+        return 2
+
+    if args.command == "list":
+        return _list_pending(store)
+    elif args.command == "show":
+        return _show(store, args.approval_id)
+    elif args.command == "approve":
+        return _approve(store, args.approval_id, args.actor,
+                        args.reason, args.no_confirm)
+    elif args.command == "reject":
+        return _reject(store, args.approval_id, args.actor,
+                       args.reason, args.no_confirm)
+    else:
+        parser.print_help()
+        return 2
 
 
 if __name__ == "__main__":

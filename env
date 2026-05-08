@@ -1,159 +1,56 @@
-# ============================================================
-# jcpr-ts-v01 — Environment Variables Example (.env.example)
-# ============================================================
-# 사용법 (Usage):
-#   1. cp .env.example .env
-#   2. chmod 600 .env
-#   3. 아래 빈 값들에 실제 KIS 자격증명 입력
-#   4. .env 파일은 절대 GitHub에 커밋 금지 (.gitignore에 등록됨)
+# =============================================================================
+# JCPR Trading System — Environment Template
+# =============================================================================
+# Copy this file to `.env` and fill in real values:
+#     cp .env.example .env
+#     chmod 600 .env
 #
-# ⚠️ 절대 원칙 (Absolute Principles):
-#   - 이 .env.example 파일에는 실제 비밀 값을 절대 적지 말 것
-#   - 실제 키는 오직 .env (Zone C — Local Only)에만
-#   - chmod 600 .env 권한 강제
-# ============================================================
+# Then edit .env with your real credentials.
+#
+# CRITICAL SECURITY NOTES:
+#   1. NEVER commit .env to git (it's in .gitignore).
+#   2. .env file MUST have permissions 0600 (owner read/write only).
+#      The loader will REFUSE to read .env if perms are looser.
+#   3. NEVER share .env via Slack, email, or any chat tool.
+#   4. If a secret is leaked, immediately revoke at KIS Developers portal:
+#      https://apiportal.koreainvestment.com/
+#
+# Get your KIS API keys at:
+#   https://apiportal.koreainvestment.com/howto-service
+# =============================================================================
 
+# -----------------------------------------------------------------------------
+# KIS Paper Trading (모의투자) — REQUIRED for paper mode
+# -----------------------------------------------------------------------------
+# Endpoint: https://openapivts.koreainvestment.com:29443
+KIS_PAPER_APPKEY=PSEDxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+KIS_PAPER_APPSECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+KIS_PAPER_ACCOUNT=12345678
+KIS_PAPER_ACCOUNT_PRODUCT=01
 
-# ============================================================
-# 운영 모드 (Operating Mode)
-# ============================================================
-# paper           = 종이 거래 (Paper trading)
-# live_limited    = 제한 라이브 (Limited-capacity live)
-# full_production = 전면 프로덕션 (Full production)
-OPERATING_MODE=paper
+# -----------------------------------------------------------------------------
+# KIS Production (실전투자) — REQUIRED for prod mode
+# -----------------------------------------------------------------------------
+# Endpoint: https://openapi.koreainvestment.com:9443
+# WARNING: Real money. Adapter requires JCPR_ALLOW_LIVE=1 to construct.
+KIS_PROD_APPKEY=PSEDxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+KIS_PROD_APPSECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+KIS_PROD_ACCOUNT=87654321
+KIS_PROD_ACCOUNT_PRODUCT=01
 
-# 세션 소유자 (Session owner — 감사 로그용)
-SESSION_OWNER=JCPR
+# -----------------------------------------------------------------------------
+# JCPR Trading System — Optional runtime settings
+# -----------------------------------------------------------------------------
+# JCPR_AUDIT_DIR=./audit
+# JCPR_POSITIONS_DB=./data/positions.db
+# JCPR_OHLCV_DB=./data/ohlcv.db
+# JCPR_QUOTE_DB=./data/quotes.db
+# JCPR_RISK_AUDIT=./audit/risk
+# JCPR_EXEC_AUDIT=./audit/exec
+# JCPR_STRATEGY_REGISTRY=./configs/strategy_registry.yaml
+# JCPR_SESSION_ID=session-001
+# JCPR_APPROVAL_DB=./runtime/approvals.db
+# JCPR_OPERATOR_ID=jcpr-trader-1
 
-
-# ============================================================
-# 브로커 자격증명 (Broker Credentials)
-# ============================================================
-# 브로커명 (Broker name) — 어댑터 선택 (Task 7-8)
-# 예: alpaca, ibkr, ...
-BROKER_NAME=
-
-# API 자격증명 (API credentials)
-# ⚠️ 이 값들은 절대 외부 시스템·로그·채팅에 노출되어서는 안 됨
-# ⚠️ NEVER expose these values to external systems / logs / chats
-BROKER_API_KEY=
-BROKER_API_SECRET=
-
-# API 엔드포인트 (Endpoint)
-# paper 와 live 가 다른 URL 인 경우가 많음
-# Paper and live often have different URLs
-BROKER_BASE_URL=
-
-# 브로커 계좌 ID (Broker account identifier)
-BROKER_ACCOUNT_ID=
-
-# 추가 인증 (Additional auth — 필요 시)
-# BROKER_OAUTH_TOKEN=
-# BROKER_REFRESH_TOKEN=
-
-# ─────────────────────────────────────────────────
-# KIS OpenAPI 자격증명 (KIS Credentials) — Task 8
-# updated 2026-05-06 17:43
-# ─────────────────────────────────────────────────
-
-# 환경 구분 — paper(모의투자, 기본) / live(실거래, 주의!)
-KIS_ENV=paper
-
-# KIS Developers Portal에서 발급받은 App Key/Secret
-# https://apiportal.koreainvestment.com
-KIS_APP_KEY=your_app_key_here
-KIS_APP_SECRET=your_app_secret_here
-
-# 계좌번호 (8자리-2자리 형식, 예: "12345678-01")
-KIS_ACCOUNT_NO=00000000-00
-
-# HTS ID (선택 — 일부 API에서만 필요)
-KIS_HTS_ID=
-
-# HTTP 설정 (기본값 사용 권장)
-KIS_REQUEST_TIMEOUT_SEC=10
-KIS_RATE_LIMIT_PER_SEC=15
-
-# ============================================================
-# 시장 데이터 (Market Data — 별도 제공자 사용 시)
-# ============================================================
-# 브로커가 시세를 제공하면 비워둠
-# Leave empty if broker provides quotes
-MARKET_DATA_PROVIDER=
-MARKET_DATA_API_KEY=
-
-
-# ============================================================
-# 데이터베이스 (Database)
-# ============================================================
-# 로컬 SQLite 경로 (Local SQLite path) — 기본값 권장
-DB_PATH=./data/jcpr.sqlite
-
-# PostgreSQL 사용 시 (If using PostgreSQL)
-# DB_URL=postgresql://user:password@localhost:5432/jcpr
-
-
-# ============================================================
-# 로깅 (Logging)
-# ============================================================
-LOG_LEVEL=INFO              # DEBUG | INFO | WARNING | ERROR
-LOG_DIR=./logs
-LOG_MASK_SECRETS=true       # 시크릿 자동 마스킹 (auto-mask secrets)
-
-
-# ============================================================
-# 비상 정지 (Emergency Stop)
-# ============================================================
-# 킬 스위치 파일 경로 — 이 파일이 존재하면 신규 주문 영구 차단
-# Kill switch file path — when present, new orders are permanently blocked
-KILL_SWITCH_PATH=./runtime/KILL_SWITCH_ON
-
-
-# ============================================================
-# 보고서 (Reports)
-# ============================================================
-REPORT_DIR=./reports/output
-REPORT_FORMAT=html          # html | pdf | json
-
-
-# ============================================================
-# 설정 파일 경로 (Config File Paths)
-# ============================================================
-# 모드별로 다른 설정 파일 사용
-# Different config per operating mode
-CAPACITY_CONFIG=./configs/capacity.local.yaml
-RISK_LIMITS_CONFIG=./configs/risk_limits.local.yaml
-LIVE_LIMITED_CONFIG=./configs/live_limited.yaml
-
-
-# ============================================================
-# MCP 서버 (MCP Servers — Task 34-35, 선택)
-# ============================================================
-# MCP_READONLY_PORT=8765
-# MCP_RESTRICTED_PORT=8766
-
-
-# ============================================================
-# LLM / 에이전트 (LLM / Agents — Task 36-39, 선택)
-# ============================================================
-# 에이전트 기능 사용 시에만 설정
-# Required only if using agent features
-# ANTHROPIC_API_KEY=
-
-
-# ============================================================
-# 알림 (Notifications — 선택)
-# ============================================================
-# 비상 정지·예외 발생 시 알림 채널 (선택)
-# Notification channels for emergency stops / exceptions (optional)
-# NOTIFY_EMAIL=
-# NOTIFY_WEBHOOK_URL=
-
-
-# ============================================================
-# 종료 (End of file)
-# ============================================================
-# 마지막 점검 (Final check):
-#   - 본 파일(.env.example)에는 실제 값이 없어야 합니다.
-#   - This file (.env.example) must contain NO real values.
-# ============================================================
+# Live mode safety — set to "1" only after careful review
+# JCPR_ALLOW_LIVE=0

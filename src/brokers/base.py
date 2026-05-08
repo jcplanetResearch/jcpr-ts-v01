@@ -1,211 +1,298 @@
-"""브로커 어댑터 추상 베이스 (Abstract broker adapter).
+"""Task 9 — Broker adapter abstract interface.
 
-다중 브로커 지원을 위한 인터페이스. 모든 구체 어댑터는 본 클래스를 상속한다.
-- 첫 구현: KIS adapter (Task 8) — src/brokers/kis_adapter.py
-- 추후 추가 가능: 키움, NH, 미래에셋 등
+Defines two contracts:
 
-설계 원칙 (Design principles):
-1. 브로커 중립적 (broker-neutral) — 어떤 KRX 브로커든 동일 인터페이스로 표현
-2. 시크릿 미반환 — 어떤 메서드도 API key/token 자체를 반환하지 않음
-3. 표준화된 예외 — 브로커별 오류는 errors.py 의 트리로 매핑
-4. Idempotency 지원 — place_order 는 client_order_id 로 중복 방지 (Task 22)
-5. 레이트 리밋 노출 — 상위 모듈이 백오프 전략을 짤 수 있도록
+1. **BrokerAdapter** — read-only broker operations (account, positions, orders).
+   Used by Task 9 scripts (check_broker_connection, show_positions, show_orders).
 
-관련 모듈 (Related modules):
-- src/brokers/types.py               — 공통 데이터 타입
-- src/brokers/errors.py              — 표준화된 예외 계층
-- src/execution/execution_gateway.py — Task 21, 본 인터페이스의 주 사용처
-- src/execution/idempotency.py       — Task 22, client_order_id 발급
-- src/risk/risk_gate.py              — Task 19, 주문 발주 전 게이트
+2. **BrokerExecutionInterface** — write operations (place/cancel orders).
+   Defined here but **NOT used by Task 9**. Task 40 (approval workflow) is the
+   only place that may call these methods, after operator approval. Defining
+   this interface in Task 9 makes the Task 40 contract explicit.
+
+Security guarantees:
+    - All methods return frozen dataclasses (no mutable state leaks).
+    - Decimal-only for any monetary values.
+    - UTC tz-aware datetimes.
+    - No credentials passed via method args — adapter holds them internally.
+    - Adapter mode is immutable: 'paper' or 'prod' fixed at construction.
 """
 from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Optional, Sequence
-
-from .types import (
-    Account,
-    Fill,
-    HealthStatus,
-    OrderAck,
-    OrderIntent,
-    OrderStatus,
-    Position,
-    Quote,
-    RateLimitInfo,
-)
+from enum import Enum
+from typing import Any, Mapping, Sequence
 
 
-# ============================================================
-# 추상 베이스 (Abstract Base)
-# ============================================================
+# =============================================================================
+# Enums and constants
+# =============================================================================
+
+class BrokerMode(str, Enum):
+    """Broker connection mode. Paper is default for safety."""
+    PAPER = "paper"
+    PROD = "prod"
+
+
+class OrderSide(str, Enum):
+    BUY = "buy"
+    SELL = "sell"
+
+
+class OrderType(str, Enum):
+    MARKET = "market"
+    LIMIT = "limit"
+
+
+class OrderStatus(str, Enum):
+    PENDING = "pending"
+    PARTIALLY_FILLED = "partially_filled"
+    FILLED = "filled"
+    CANCELLED = "cancelled"
+    REJECTED = "rejected"
+
+
+# =============================================================================
+# Frozen data structures — immutable broker responses
+# =============================================================================
+
+@dataclass(frozen=True, slots=True)
+class AccountSummary:
+    """Account balance snapshot. Currency = KRW for KIS domestic."""
+    account_id_masked: str
+    cash_balance_krw: Decimal
+    total_equity_krw: Decimal
+    buying_power_krw: Decimal
+    mode: BrokerMode
+    fetched_at_utc: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.cash_balance_krw, Decimal):
+            raise TypeError("cash_balance_krw must be Decimal")
+        if not isinstance(self.total_equity_krw, Decimal):
+            raise TypeError("total_equity_krw must be Decimal")
+        if not isinstance(self.buying_power_krw, Decimal):
+            raise TypeError("buying_power_krw must be Decimal")
+        if self.fetched_at_utc.tzinfo is None:
+            raise ValueError("fetched_at_utc must be tz-aware (UTC)")
+
+
+@dataclass(frozen=True, slots=True)
+class Position:
+    """Single position in the portfolio."""
+    symbol: str
+    quantity: Decimal
+    avg_cost_krw: Decimal
+    current_price_krw: Decimal
+    market_value_krw: Decimal
+    unrealized_pnl_krw: Decimal
+
+    def __post_init__(self) -> None:
+        if not self.symbol or not isinstance(self.symbol, str):
+            raise ValueError("symbol must be non-empty string")
+        for name in ("quantity", "avg_cost_krw", "current_price_krw",
+                     "market_value_krw", "unrealized_pnl_krw"):
+            value = getattr(self, name)
+            if not isinstance(value, Decimal):
+                raise TypeError(f"{name} must be Decimal")
+
+
+@dataclass(frozen=True, slots=True)
+class Order:
+    """A broker order record (read-only view)."""
+    order_id: str
+    symbol: str
+    side: OrderSide
+    order_type: OrderType
+    quantity: Decimal
+    filled_quantity: Decimal
+    limit_price_krw: Decimal | None
+    avg_fill_price_krw: Decimal | None
+    status: OrderStatus
+    placed_at_utc: datetime
+    last_updated_utc: datetime
+
+    def __post_init__(self) -> None:
+        if not self.order_id or not isinstance(self.order_id, str):
+            raise ValueError("order_id must be non-empty string")
+        if not isinstance(self.quantity, Decimal):
+            raise TypeError("quantity must be Decimal")
+        if not isinstance(self.filled_quantity, Decimal):
+            raise TypeError("filled_quantity must be Decimal")
+        if self.placed_at_utc.tzinfo is None:
+            raise ValueError("placed_at_utc must be tz-aware (UTC)")
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectionCheck:
+    """Result of a broker connectivity check."""
+    success: bool
+    mode: BrokerMode
+    base_url: str
+    tls_version: str
+    token_valid: bool
+    token_expires_at_utc: datetime | None
+    server_time_utc: datetime | None
+    error_message: str | None
+    elapsed_ms: int
+
+    def __post_init__(self) -> None:
+        if self.token_expires_at_utc is not None:
+            if self.token_expires_at_utc.tzinfo is None:
+                raise ValueError("token_expires_at_utc must be tz-aware")
+
+
+# =============================================================================
+# BrokerAdapter — abstract base class (read-only operations)
+# =============================================================================
+
 class BrokerAdapter(ABC):
-    """모든 브로커 어댑터의 추상 베이스.
+    """Abstract broker adapter. Read-only operations only.
 
-    하위 클래스 구현 시 주의사항 (Implementation notes):
-    - __init__ 에서 인증 정보를 받되, 평문 보관하지 말고 세션 토큰으로 즉시 변환.
-    - 토큰은 인스턴스 내부 비공개 속성(_token)으로만 보관, 메서드로 반환 금지.
-    - 브로커별 raw 응답은 본 모듈의 표준 타입으로 변환 후 반환.
-    - 브로커별 오류 코드는 errors.py 의 예외 트리로 매핑.
-    - 모든 메서드는 호출 시점에 self-contained 하게 동작 (외부 상태 의존 최소화).
+    Concrete implementations (e.g. KISBrokerAdapter) must:
+        1. Hold credentials internally (never accept them as method args).
+        2. Set self._mode at __init__ and never change it.
+        3. Use TLS 1.2+ for all HTTP calls.
+        4. Mask credentials in any log output.
     """
 
-    # ============================================================
-    # 1. 메타 정보 (Identity)
-    # ============================================================
     @property
     @abstractmethod
-    def name(self) -> str:
-        """브로커명 — 'kis', 'kiwoom', 'nh' 등 소문자 단일 토큰.
-
-        로깅·라우팅·설정 매핑에 사용된다.
-        """
+    def mode(self) -> BrokerMode:
+        """Returns the broker mode (paper or prod). Set at __init__."""
+        ...
 
     @property
     @abstractmethod
-    def supports_paper(self) -> bool:
-        """모의투자(paper) 계좌를 지원하는가?
+    def adapter_name(self) -> str:
+        """Adapter identifier (e.g. 'kis')."""
+        ...
 
-        지원 시, OPERATING_MODE='paper' 환경변수로 페이퍼/실거래 분기 가능.
+    @abstractmethod
+    def check_connection(self) -> ConnectionCheck:
+        """Verify connectivity, TLS version, token validity, server time.
+
+        Must NOT raise on connection failure — return ConnectionCheck with
+        success=False instead. Only raises for programming errors.
         """
+        ...
 
     @abstractmethod
-    def rate_limit_info(self) -> RateLimitInfo:
-        """브로커의 레이트 리밋 사양 반환.
-
-        상위 모듈은 본 정보로 호출 빈도를 조절한다.
-        실제 한도와 다를 경우 보수적으로(낮게) 보고할 것을 권장.
-        """
-
-    # ============================================================
-    # 2. 인증 / 세션 (Authentication & Session)
-    # ============================================================
-    @abstractmethod
-    def authenticate(self) -> None:
-        """토큰 발급 또는 갱신.
-
-        SECURITY:
-        - 본 메서드는 토큰 자체를 반환하지 않는다.
-        - 토큰은 인스턴스 내부에 비공개 속성으로 저장.
-        - 토큰을 로그·예외·반환값에 노출 금지.
-
-        실패 시 errors.AuthError 또는 errors.PermissionError 를 던진다.
-        """
+    def get_account_summary(self) -> AccountSummary:
+        """Fetch cash balance, total equity, buying power."""
+        ...
 
     @abstractmethod
-    def is_authenticated(self) -> bool:
-        """현재 토큰이 유효한가? (만료/회전 필요 여부 판단용)
-
-        네트워크 호출 없이 로컬 상태만으로 판단한다 (e.g. 토큰 만료 시각 비교).
-        실제 유효성은 health_check() 로 확인.
-        """
+    def get_positions(self) -> tuple[Position, ...]:
+        """Fetch all current positions (long + short)."""
+        ...
 
     @abstractmethod
-    def health_check(self) -> HealthStatus:
-        """브로커 연결 상태 점검.
+    def get_orders(
+        self,
+        *,
+        status: OrderStatus | None = None,
+        symbol: str | None = None,
+        limit: int = 50,
+    ) -> tuple[Order, ...]:
+        """Fetch order history. Filter by status and/or symbol."""
+        ...
 
-        가벼운 read-only 호출로 연결성·인증을 검증한다 (예: 계좌 요약 1건 조회).
-        """
 
-    # ============================================================
-    # 3. 계좌 / 포지션 / 잔고 (Account, Positions, Cash)
-    # ============================================================
-    @abstractmethod
-    def get_account(self) -> Account:
-        """계좌 요약 조회.
+# =============================================================================
+# BrokerExecutionInterface — write operations (Task 40 only)
+# =============================================================================
 
-        SECURITY: 반환되는 Account.account_id_masked 는 반드시 마스킹된 형태.
-        types.py 의 검증기가 '***' 미포함 시 모델 생성을 거부한다.
-        """
+@dataclass(frozen=True, slots=True)
+class OrderRequest:
+    """Order placement request. Constructed by Task 40 ExecutionGateway."""
+    symbol: str
+    side: OrderSide
+    order_type: OrderType
+    quantity: Decimal
+    limit_price_krw: Decimal | None
+    client_order_id: str       # idempotency key (from Task 22)
+    strategy_id: str
+    approval_id: str           # Task 40 approval reference
+    requested_at_utc: datetime
 
-    @abstractmethod
-    def get_positions(self) -> Sequence[Position]:
-        """현재 보유 포지션 목록.
+    def __post_init__(self) -> None:
+        if not self.symbol or not isinstance(self.symbol, str):
+            raise ValueError("symbol must be non-empty")
+        if not isinstance(self.quantity, Decimal):
+            raise TypeError("quantity must be Decimal")
+        if self.quantity <= Decimal("0"):
+            raise ValueError("quantity must be positive")
+        if self.order_type == OrderType.LIMIT:
+            if self.limit_price_krw is None:
+                raise ValueError("limit_price_krw required for LIMIT orders")
+            if not isinstance(self.limit_price_krw, Decimal):
+                raise TypeError("limit_price_krw must be Decimal")
+            if self.limit_price_krw <= Decimal("0"):
+                raise ValueError("limit_price_krw must be positive")
+        if not self.client_order_id or len(self.client_order_id) > 80:
+            raise ValueError("client_order_id must be 1..80 chars")
+        if not self.approval_id:
+            raise ValueError("approval_id required — Task 40 approval reference")
+        if self.requested_at_utc.tzinfo is None:
+            raise ValueError("requested_at_utc must be tz-aware")
 
-        수량이 0인 포지션은 반환하지 않는다.
-        """
 
-    @abstractmethod
-    def get_cash_balance(self) -> Decimal:
-        """가용 현금 잔고 (account.currency 기준)."""
+@dataclass(frozen=True, slots=True)
+class OrderResponse:
+    """Broker response after place/cancel."""
+    success: bool
+    broker_order_id: str | None
+    client_order_id: str
+    status: OrderStatus
+    error_code: str | None
+    error_message: str | None
+    received_at_utc: datetime
 
-    # ============================================================
-    # 4. 시세 (Quotes)
-    # ============================================================
-    @abstractmethod
-    def get_quote(self, symbol: str) -> Quote:
-        """단일 심볼 시세 스냅샷.
 
-        Raises:
-            errors.NotFoundError: 미존재 심볼.
-            errors.ValidationError: 잘못된 심볼 형식.
-        """
+class BrokerExecutionInterface(ABC):
+    """Write operations. **Task 40 ONLY** may call these.
 
-    # ============================================================
-    # 5. 주문 (Orders)
-    # ============================================================
-    @abstractmethod
-    def place_order(self, intent: OrderIntent) -> OrderAck:
-        """주문 발주.
+    A KIS adapter implementing this interface is the only path to live orders.
+    Task 9 scripts must NOT instantiate this — only Task 40 ExecutionGateway.
 
-        IDEMPOTENCY:
-        - intent.client_order_id 로 중복 발주 방지 (Task 22).
-        - 동일 client_order_id 로 두 번 호출 시:
-          * 첫 호출의 OrderAck 를 그대로 반환하거나,
-          * errors.ValidationError 로 거부 (어댑터 정책).
-
-        EMERGENCY STOP:
-        - 본 메서드 자체는 비상 정지 검사를 수행하지 않는다.
-        - 비상 정지는 호출자(execution_gateway, risk_gate)가 책임진다.
-        - 비상 정지가 활성이면 호출자가 본 메서드를 호출하지 않아야 한다.
-
-        Raises:
-            errors.OrderRejectedError: 브로커가 주문 거부.
-            errors.MarketClosedError:  시장 마감.
-            errors.AuthError:          토큰 만료 등.
-            errors.RateLimitError:     레이트 리밋.
-            errors.TransientError:     일시적 오류 (재시도 가능).
-        """
-
-    @abstractmethod
-    def cancel_order(self, broker_order_id: str) -> OrderAck:
-        """미체결 주문 취소.
-
-        취소 후 OrderAck 의 status 는 CANCELLED 또는 부분 체결 후 잔량 취소
-        상황을 반영한다.
-
-        Raises:
-            errors.NotFoundError: 미존재 주문 ID.
-        """
+    Implementations MUST verify:
+        1. self.mode == BrokerMode.PROD requires JCPR_ALLOW_LIVE=1 env var.
+        2. Every place_order call has a non-empty approval_id from Task 40.
+        3. client_order_id idempotency — same id → same outcome.
+        4. ESC/Ctrl-C signal cancellation prevails over new orders.
+    """
 
     @abstractmethod
-    def get_order_status(self, broker_order_id: str) -> OrderStatus:
-        """단일 주문의 현재 상태."""
+    def place_order(self, request: OrderRequest) -> OrderResponse:
+        """Place a new order. Idempotent on client_order_id."""
+        ...
 
     @abstractmethod
-    def get_fills(self, since: datetime) -> Sequence[Fill]:
-        """since 이후 발생한 체결 목록.
+    def cancel_order(
+        self,
+        *,
+        broker_order_id: str,
+        approval_id: str,
+    ) -> OrderResponse:
+        """Cancel an existing order. Requires Task 40 approval_id."""
+        ...
 
-        Task 24 (fills ingestion) 의 입력으로 사용.
-        시간 비교는 브로커의 ts 기준이며, 포함 경계는 '>=since'.
-        """
 
-    # ============================================================
-    # 6. 시장 캘린더 (Market Calendar)
-    # ============================================================
-    @abstractmethod
-    def is_market_open(self, ts: Optional[datetime] = None) -> bool:
-        """주어진 시각(또는 현재)에 시장이 열려 있는가?
-
-        Note:
-        - 어댑터가 자체 캘린더를 제공하지 않으면 NotImplementedError 를 던진다.
-        - 그 경우 src/data/calendar.py (Task 11) 의 캘린더가 사용된다.
-        """
-
-    # ============================================================
-    # 7. 표현 (Representation)
-    # ============================================================
-    def __repr__(self) -> str:
-        """디버깅용 repr — 시크릿이 들어가지 않도록 name 만 노출."""
-        return f"<{type(self).__name__} name={self.name!r}>"
+__all__ = (
+    "BrokerMode",
+    "OrderSide",
+    "OrderType",
+    "OrderStatus",
+    "AccountSummary",
+    "Position",
+    "Order",
+    "OrderRequest",
+    "OrderResponse",
+    "ConnectionCheck",
+    "BrokerAdapter",
+    "BrokerExecutionInterface",
+)

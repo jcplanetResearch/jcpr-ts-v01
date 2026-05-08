@@ -1,34 +1,56 @@
-"""src/execution — 주문 실행 계층 (Order execution layer).
+"""src/execution/ — Trading execution & approval workflow.
 
-- order_intent : OrderIntent 발전형 + 상태 머신 (Task 17)
-- sizing       : 사이징 엔진 (Task 18)
-- _fees        : KRX 수수료·세금 추정 (helper)
+Phase 1 (this commit): Unified ApprovalStore replaces the two previous stores.
+Phase 2 (next): ExecutionGateway integration with MCP write handlers.
+
+This file currently exports ONLY the unified ApprovalStore. Other modules
+(ExecutionGateway, OrderRequest, etc.) remain in their original files and
+are imported by callers as before until Phase 2.
 """
-from src.execution.order_intent import (
-    IntentState,
-    OrderIntent,
-    StateTransition,
-)
-from src.execution.sizing import (
-    CapacityLimits,
-    Sizer,
-    SizingConfig,
-    SizingContext,
-    SizingPolicy,
-)
-from src.execution._fees import estimate_fee_krw
+from __future__ import annotations
 
-__all__ = [
-    # order_intent
-    "IntentState",
-    "OrderIntent",
-    "StateTransition",
-    # sizing
-    "CapacityLimits",
-    "Sizer",
-    "SizingConfig",
-    "SizingContext",
-    "SizingPolicy",
-    # fees
-    "estimate_fee_krw",
-]
+from .approval_store import (
+    ACTION_CANCEL_ORDER,
+    ACTION_KILL_SWITCH,
+    ACTION_SET_CAPACITY,
+    ACTION_SUBMIT_ORDER,
+    DEFAULT_APPROVAL_TTL_SECONDS,
+    DEFAULT_EXECUTE_TTL_SECONDS,
+    DEFAULT_KILL_SWITCH_TTL_SECONDS,
+    VALID_ACTION_KINDS,
+    ApprovalExpiredError,
+    ApprovalIntegrityError,
+    ApprovalNotFound,
+    ApprovalRecord,
+    ApprovalState,
+    ApprovalStateError,
+    ApprovalStore,
+    ApprovalStoreError,
+    LiveModeBlockedError,
+    SelfApprovalError,
+)
+
+__all__ = (
+    # Enums + records
+    "ApprovalState",
+    "ApprovalRecord",
+    # Store
+    "ApprovalStore",
+    # Constants
+    "ACTION_SUBMIT_ORDER",
+    "ACTION_CANCEL_ORDER",
+    "ACTION_SET_CAPACITY",
+    "ACTION_KILL_SWITCH",
+    "VALID_ACTION_KINDS",
+    "DEFAULT_APPROVAL_TTL_SECONDS",
+    "DEFAULT_EXECUTE_TTL_SECONDS",
+    "DEFAULT_KILL_SWITCH_TTL_SECONDS",
+    # Exceptions
+    "ApprovalStoreError",
+    "ApprovalNotFound",
+    "ApprovalStateError",
+    "SelfApprovalError",
+    "ApprovalExpiredError",
+    "ApprovalIntegrityError",
+    "LiveModeBlockedError",
+)
