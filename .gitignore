@@ -67,3 +67,5 @@ audit/
 # Backup folders created by sync scripts
 .backup_task*/
 .venv/
+
+data/approvals.sqlite*
