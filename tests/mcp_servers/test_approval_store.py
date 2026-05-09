@@ -1,3 +1,4 @@
+
 """
 스모크 테스트 — _approval_store
 =================================
@@ -17,7 +18,6 @@ _REPO = Path(__file__).resolve().parent.parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from src.mcp_servers._approval_store import (  # noqa: E402
     ACTION_CANCEL_ORDER,
     ACTION_KILL_SWITCH,
     ACTION_SET_CAPACITY,

@@ -41,16 +41,16 @@ KIS_PROD_ACCOUNT_PRODUCT=01
 # -----------------------------------------------------------------------------
 # JCPR Trading System — Optional runtime settings
 # -----------------------------------------------------------------------------
-# JCPR_AUDIT_DIR=./audit
-# JCPR_POSITIONS_DB=./data/positions.db
-# JCPR_OHLCV_DB=./data/ohlcv.db
-# JCPR_QUOTE_DB=./data/quotes.db
-# JCPR_RISK_AUDIT=./audit/risk
-# JCPR_EXEC_AUDIT=./audit/exec
-# JCPR_STRATEGY_REGISTRY=./configs/strategy_registry.yaml
-# JCPR_SESSION_ID=session-001
-# JCPR_APPROVAL_DB=./runtime/approvals.db
-# JCPR_OPERATOR_ID=jcpr-trader-1
+JCPR_AUDIT_DIR=./audit
+JCPR_POSITIONS_DB=./data/positions.db
+JCPR_OHLCV_DB=./data/ohlcv.db
+JCPR_QUOTE_DB=./data/quotes.db
+JCPR_RISK_AUDIT=./audit/risk
+JCPR_EXEC_AUDIT=./audit/exec
+JCPR_STRATEGY_REGISTRY=./configs/strategy_registry.yaml
+JCPR_SESSION_ID=session-001
+JCPR_APPROVAL_DB=./runtime/approvals.db
+JCPR_OPERATOR_ID=jcpr-trader-1
 
 # Live mode safety — set to "1" only after careful review
-# JCPR_ALLOW_LIVE=0
+JCPR_ALLOW_LIVE=0

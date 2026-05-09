@@ -1,507 +1,691 @@
-"""
-MCP Restricted 서버 (MCP Restricted Server)
-=============================================
+"""Restricted MCP server — Phase 2 (unified store + ExecutionGateway DI).
 
-JCPR Trading System - jcpr-ts-v01
-Task 35 v0.1
+Exposes 8 write tools to LLM agents. Internal CLI handlers (approve_action,
+reject_action) are intentionally NOT registered with the MCP transport.
 
-Write 도구를 제공하되, 모든 도구는 인간 승인 게이트 통과 필수.
-(Provides write tools but all require human approval gate.)
-
-핵심 보안 (Critical Security):
-    1. Agent 단독 실행 금지 — request → 승인 → execute 3단계
-    2. self-approval 차단 (operator_id != requested_by)
-    3. paper-only 강제 (allow_live=True 명시 + mode='live' 명시 시만)
-    4. 모든 호출 audit
-    5. stdio 전용
-    6. 도메인 실행은 stub (Task 21 미통합)
-
-내부 도구 (CLI 전용 — MCP 노출 안 함):
-    - approve_action / reject_action — scripts/approve_cli.py 가 호출
+Phase 2 changes:
+  - ApprovalStore is constructed once and shared with ExecutionGateway.
+  - ExecutionGateway is injected — no more stub.
+  - JCPR_APPROVAL_DB env var (single path).
+  - All handler exceptions are mapped to MCP-friendly error responses.
 """
 
 from __future__ import annotations
 
-import json
 import logging
+import signal
 import sys
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
-from mcp.server.fastmcp import FastMCP
-
-from src.observability import (
-    AuditWriter,
-    ORIGIN_AGENT,
-    TraceContext,
-    configure_default_writer,
-    get_default_writer,
+from src.execution.approval_store import ApprovalStore, ApprovalStoreError
+from src.execution.execution_gateway import ExecutionGateway, GatewayError
+from src.mcp_servers._config import (
+    RestrictedServerConfig,
+    load_restricted_config,
+)
+from src.mcp_servers._write_handlers import (
+    WriteHandlerError,
+    WriteHandlers,
+    build_handlers,
 )
 
-from ._approval_store import ApprovalStore
-from ._config import RestrictedServerConfig, load_restricted_config_from_env
-from ._security import (
-    RateLimiter,
-    check_result_size,
-)
-from . import _write_handlers as wh
-
-
-logger = logging.getLogger("jcpr.mcp.restricted")
-_handler_set = False
-
-
-def _setup_logging() -> None:
-    global _handler_set
-    if _handler_set:
-        return
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter(
-        "[%(asctime)s] %(levelname)s %(name)s: %(message)s"
-    ))
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    _handler_set = True
-
-
-# ─────────────────────────────────────────────────
-# Trace + Audit 헬퍼
-# ─────────────────────────────────────────────────
-
-def _make_tool_trace(
-    config: RestrictedServerConfig,
-    tool_name: str,
-    correlation: Optional[dict] = None,
-) -> TraceContext:
-    keys: dict[str, Any] = {
-        "tool": tool_name,
-        "server": "restricted_mcp",
-    }
-    if correlation:
-        keys.update(correlation)
-    return TraceContext.new(
-        origin=ORIGIN_AGENT,
-        operator_id="mcp_client",
-        session_id=config.session_id,
-        correlation_keys=keys,
-    )
-
-
-def _audit_call_start(
-    writer: Optional[AuditWriter],
-    ctx: TraceContext,
-    tool_name: str,
-    args: dict,
-) -> None:
-    if writer is None:
-        return
-    writer.write_mcp_call(ctx, payload={"tool": tool_name, "args": args})
-
-
-def _audit_call_result(
-    writer: Optional[AuditWriter],
-    ctx: TraceContext,
-    tool_name: str,
-    result: dict,
-) -> None:
-    if writer is None:
-        return
-    summary = {
-        "tool": tool_name,
-        "ok": result.get("ok"),
-        "approval_id": result.get("approval_id"),
-        "status": result.get("status"),
-    }
-    if not result.get("ok"):
-        summary["error_code"] = result.get("error_code")
-        summary["error_message"] = result.get("error_message", "")[:200]
-    writer.write_mcp_result(ctx, payload=summary)
-
-
-def _audit_approval_event(
-    writer: Optional[AuditWriter],
-    ctx: TraceContext,
-    event_type: str,
-    result: dict,
-) -> None:
-    """승인 관련 audit (approval_request/approval_decision)."""
-    if writer is None or not result.get("ok"):
-        return
-    payload = {
-        "approval_id": result.get("approval_id"),
-        "action_type": result.get("action_type"),
-        "status": result.get("status"),
-        "requested_by": result.get("requested_by"),
-        "decided_by": result.get("decided_by"),
-    }
-    if event_type == "approval_request":
-        writer.write_approval_request(ctx, payload=payload)
-    elif event_type == "approval_decision":
-        writer.write_approval_decision(ctx, payload=payload)
-
-
-# ─────────────────────────────────────────────────
-# Wrapper (rate limit + audit + size check)
-# ─────────────────────────────────────────────────
-
-def _wrap_call(
-    config: RestrictedServerConfig,
-    rate_limiter: RateLimiter,
-    tool_name: str,
-    handler_fn,
-    args: dict,
-    *,
-    audit_event_type: Optional[str] = None,
-) -> dict:
-    """공통 wrapper: rate limit → audit → handler → audit → size check."""
-    writer = get_default_writer()
-    ctx = _make_tool_trace(config, tool_name, correlation={
-        "args_keys": list(args.keys()),
-    })
-
-    ok, err = rate_limiter.check()
-    if not ok:
-        result = {
-            "ok": False,
-            "error_code": "RATE_LIMIT",
-            "error_message": err,
-        }
-        _audit_call_result(writer, ctx, tool_name, result)
-        return result
-
-    _audit_call_start(writer, ctx, tool_name, args)
-
-    try:
-        result = handler_fn(**args)
-    except TypeError as e:
-        result = {
-            "ok": False, "error_code": "INVALID_ARGS",
-            "error_message": str(e),
-        }
-    except Exception as e:  # noqa: BLE001
-        if writer is not None:
-            writer.write_exception(ctx, e, additional={"tool": tool_name})
-        result = {
-            "ok": False, "error_code": "HANDLER_ERROR",
-            "error_message": f"{type(e).__name__}: {e}",
-        }
-
-    # 크기 검증
-    try:
-        s = json.dumps(result, ensure_ascii=False, default=str)
-        ok_size, msg = check_result_size(s)
-        if not ok_size:
-            result = {
-                "ok": False, "error_code": "RESULT_TOO_LARGE",
-                "error_message": msg,
-            }
-    except Exception as e:  # noqa: BLE001
-        result = {
-            "ok": False, "error_code": "SERIALIZATION_ERROR",
-            "error_message": str(e),
-        }
-
-    _audit_call_result(writer, ctx, tool_name, result)
-    if audit_event_type:
-        _audit_approval_event(writer, ctx, audit_event_type, result)
-
-    result["_trace_id"] = ctx.trace_id
-    return result
-
-
-# ─────────────────────────────────────────────────
-# Server Builder
-# ─────────────────────────────────────────────────
-
-def build_server(
-    config: Optional[RestrictedServerConfig] = None,
-    *,
-    store: Optional[ApprovalStore] = None,
-) -> tuple[FastMCP, ApprovalStore]:
-    """
-    FastMCP restricted 서버 빌드.
-
-    Args:
-        config: 설정 (None이면 환경변수에서 로드)
-        store: ApprovalStore 인스턴스 (None이면 config로 생성 — 테스트 편의)
-
-    Returns:
-        (FastMCP 인스턴스, ApprovalStore)
-    """
-    _setup_logging()
-
-    if config is None:
-        config = load_restricted_config_from_env()
-
-    if get_default_writer() is None:
-        configure_default_writer(config.audit_dir)
-        logger.info(f"AuditWriter configured: {config.audit_dir}")
-
-    if store is None:
-        store = ApprovalStore(
-            db_path=config.approval_db,
-            default_ttl_seconds=config.approval_ttl_seconds,
-            execute_ttl_seconds=config.execute_ttl_seconds,
-            allow_self_approval=config.allow_self_approval,
-        )
-
-    rate_limiter = RateLimiter(max_per_minute=config.rate_limit_per_minute)
-
-    mcp = FastMCP(
-        name="jcpr-restricted",
-        instructions=(
-            "JCPR restricted MCP server. All write operations require "
-            "human approval (3-phase: request → approve → execute). "
-            "Default mode is paper-only. Live mode requires explicit "
-            "config + mode='live' in payload."
-        ),
-    )
-
-    # ─── Tool 1: request_submit_order ─────────
-    @mcp.tool()
-    def request_submit_order(
-        symbol: str,
-        side: str,
-        qty: int,
-        order_type: str = "market",
-        price_krw: Optional[str] = None,
-        mode: str = "paper",
-        strategy_id: Optional[str] = None,
-        client_order_id: Optional[str] = None,
-        requested_by: str = "agent",
-    ) -> dict:
-        """
-        Request order submission (REQUIRES HUMAN APPROVAL).
-
-        Creates a pending approval. Operator must approve via CLI/dashboard
-        before execute_approved_action can run.
-
-        Args:
-            symbol: Trading symbol (e.g. "005930")
-            side: "buy" or "sell"
-            qty: Quantity (positive integer)
-            order_type: "market" or "limit"
-            price_krw: Required if order_type="limit"
-            mode: "paper" (default) or "live" (requires server config)
-            strategy_id: Optional strategy attribution
-            client_order_id: Optional idempotency token
-            requested_by: Caller identity (agent name)
-
-        Returns approval_id and pending status.
-        """
-        # 자동 trace_id (도구 호출별)
-        ctx = _make_tool_trace(config, "request_submit_order")
-        return _wrap_call(
-            config, rate_limiter,
-            "request_submit_order",
-            lambda **kw: wh.request_submit_order(config, store, **kw),
-            args={
-                "symbol": symbol, "side": side, "qty": qty,
-                "order_type": order_type, "price_krw": price_krw,
-                "mode": mode, "strategy_id": strategy_id,
-                "client_order_id": client_order_id,
-                "requested_by": requested_by,
-                "trace_id": ctx.trace_id,
-                "parent_trace_id": None,
-            },
-            audit_event_type="approval_request",
-        )
-
-    # ─── Tool 2: request_cancel_order ─────────
-    @mcp.tool()
-    def request_cancel_order(
-        order_id: str,
-        reason: str = "",
-        requested_by: str = "agent",
-    ) -> dict:
-        """
-        Request order cancellation (REQUIRES HUMAN APPROVAL).
-
-        Args:
-            order_id: Existing order ID to cancel
-            reason: Cancellation reason (≤500 chars)
-            requested_by: Caller identity
-        """
-        ctx = _make_tool_trace(config, "request_cancel_order")
-        return _wrap_call(
-            config, rate_limiter,
-            "request_cancel_order",
-            lambda **kw: wh.request_cancel_order(config, store, **kw),
-            args={
-                "order_id": order_id, "reason": reason,
-                "requested_by": requested_by,
-                "trace_id": ctx.trace_id,
-            },
-            audit_event_type="approval_request",
-        )
-
-    # ─── Tool 3: request_set_capacity ─────────
-    @mcp.tool()
-    def request_set_capacity(
-        capacity_krw: str,
-        target: str = "total",
-        strategy_id: Optional[str] = None,
-        reason: str = "",
-        requested_by: str = "agent",
-    ) -> dict:
-        """
-        Request capacity limit change (REQUIRES HUMAN APPROVAL).
-
-        Args:
-            capacity_krw: New capacity as decimal string
-            target: "total" or "per_strategy"
-            strategy_id: Required if target="per_strategy"
-            reason: Justification
-            requested_by: Caller identity
-        """
-        ctx = _make_tool_trace(config, "request_set_capacity")
-        return _wrap_call(
-            config, rate_limiter,
-            "request_set_capacity",
-            lambda **kw: wh.request_set_capacity(config, store, **kw),
-            args={
-                "capacity_krw": capacity_krw,
-                "target": target,
-                "strategy_id": strategy_id,
-                "reason": reason,
-                "requested_by": requested_by,
-                "trace_id": ctx.trace_id,
-            },
-            audit_event_type="approval_request",
-        )
-
-    # ─── Tool 4: request_kill_switch ──────────
-    @mcp.tool()
-    def request_kill_switch(
-        activate: bool,
-        reason: str,
-        requested_by: str = "agent",
-    ) -> dict:
-        """
-        Request kill switch activation/deactivation (REQUIRES HUMAN APPROVAL).
-
-        URGENT use case — shorter TTL.
-
-        Args:
-            activate: True to activate (halt all trading), False to deactivate
-            reason: Required reason (≤500 chars)
-            requested_by: Caller identity
-        """
-        ctx = _make_tool_trace(config, "request_kill_switch")
-        return _wrap_call(
-            config, rate_limiter,
-            "request_kill_switch",
-            lambda **kw: wh.request_kill_switch(config, store, **kw),
-            args={
-                "activate": activate, "reason": reason,
-                "requested_by": requested_by,
-                "trace_id": ctx.trace_id,
-            },
-            audit_event_type="approval_request",
-        )
-
-    # ─── Tool 5: list_pending_approvals ───────
-    @mcp.tool()
-    def list_pending_approvals(limit: int = 20) -> dict:
-        """
-        List approvals currently pending decision.
-
-        Args:
-            limit: Max number to return (1-100)
-        """
-        return _wrap_call(
-            config, rate_limiter,
-            "list_pending_approvals",
-            lambda **kw: wh.list_pending_approvals(config, store, **kw),
-            args={"limit": limit},
-        )
-
-    # ─── Tool 6: get_approval_status ──────────
-    @mcp.tool()
-    def get_approval_status(approval_id: str) -> dict:
-        """
-        Get current status of a specific approval_id.
-
-        Args:
-            approval_id: e.g. "apv-20260507-a1b2c3d4"
-        """
-        return _wrap_call(
-            config, rate_limiter,
-            "get_approval_status",
-            lambda **kw: wh.get_approval_status(config, store, **kw),
-            args={"approval_id": approval_id},
-        )
-
-    # ─── Tool 7: cancel_request ───────────────
-    @mcp.tool()
-    def cancel_request(
-        approval_id: str,
-        reason: str = "",
-        cancelled_by: str = "agent",
-    ) -> dict:
-        """
-        Cancel a pending approval request (REQUESTER ONLY).
-
-        Only the requester can cancel their own pending request.
-        Cannot cancel approved/rejected/executed approvals.
-
-        Args:
-            approval_id: Approval to cancel
-            reason: Cancellation reason
-            cancelled_by: Must match the original requester
-        """
-        return _wrap_call(
-            config, rate_limiter,
-            "cancel_request",
-            lambda **kw: wh.cancel_request(config, store, **kw),
-            args={
-                "approval_id": approval_id,
-                "reason": reason,
-                "cancelled_by": cancelled_by,
-            },
-        )
-
-    # ─── Tool 8: execute_approved_action ──────
-    @mcp.tool()
-    def execute_approved_action(
-        approval_id: str,
-        executed_by: str = "agent",
-    ) -> dict:
-        """
-        Execute a previously-approved action.
-
-        Approval must be in 'approved' state.
-        Single-use (idempotent) — execution marks status as 'executed'.
-
-        Args:
-            approval_id: Previously-approved approval_id
-            executed_by: Caller identity
-        """
-        return _wrap_call(
-            config, rate_limiter,
-            "execute_approved_action",
-            lambda **kw: wh.execute_approved_action(config, store, **kw),
-            args={
-                "approval_id": approval_id,
-                "executed_by": executed_by,
-            },
-        )
-
-    logger.info(
-        f"jcpr-restricted MCP server built — 8 tools, "
-        f"session={config.session_id}, "
-        f"operator={config.operator_id}, "
-        f"allow_live={config.allow_live}, "
-        f"approval_db={config.approval_db}"
-    )
-    return mcp, store
-
-
-# ─────────────────────────────────────────────────
-# Public API
-# ─────────────────────────────────────────────────
 
 __all__ = [
+    "RestrictedMCPServer",
+    "RestrictedServer",          # alias of RestrictedMCPServer
+    "ToolResponse",              # call_tool response shape
     "build_server",
-    "RestrictedServerConfig",
-    "load_restricted_config_from_env",
+    "build_restricted_server",   # alias of build_server
+    "main",
 ]
+
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Server class
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Tool response object
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class ToolResponse:
+    """Object response shape for RestrictedMCPServer.call_tool.
+
+    Phase 2-B addition. Replaces the dict-shaped envelope used by the
+    internal _safe_call helper for cases where tests/callers prefer
+    attribute access (`r.ok`, `r.result["..."]`, `r.error_kind`) over
+    dict subscription. Frozen so the response cannot be mutated after
+    construction.
+
+    Fields:
+      ok          — True iff the underlying handler returned without
+                    raising any of the recognized exception types.
+      result      — Handler's return value when ok=True; None otherwise.
+      error_kind  — One of "handler", "approval_store", "gateway",
+                    "internal", "identity"; None when ok=True.
+      message     — Human-readable error message; None when ok=True.
+
+    The dict-shaped _safe_call envelope is preserved unchanged for the
+    @mcp.tool() decorator path (LLM agent transport); ToolResponse is
+    used only by the new call_tool dispatch.
+    """
+    ok: bool
+    result: Optional[dict] = None
+    error_kind: Optional[str] = None
+    message: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Server class
+# ---------------------------------------------------------------------------
+
+class RestrictedMCPServer:
+    """Wraps FastMCP with the 8 exposed write tools.
+
+    Constructed via build_server(). Lifecycle:
+        - __init__:  wires store + gateway + handlers (no I/O yet)
+        - register(): attaches @mcp.tool() decorators
+        - run():     starts stdio transport (blocking)
+        - close():   closes store, broker session, audit writer
+    """
+
+    def __init__(
+        self,
+        *,
+        config: RestrictedServerConfig,
+        store: ApprovalStore,
+        gateway: ExecutionGateway,
+        handlers: WriteHandlers,
+        mcp_factory: Optional[Any] = None,
+    ) -> None:
+        self._config = config
+        self._store = store
+        self._gateway = gateway
+        self._handlers = handlers
+        self._interrupt_flag = False
+
+        # Install ESC/Ctrl-C handler — must fire before any new trade.
+        # The flag is queried by ExecutionGateway via interrupt_check.
+        self._install_signal_handlers()
+
+        # Build MCP server (FastMCP). Use injected factory for testing.
+        self._mcp = self._build_mcp(mcp_factory)
+
+    @property
+    def config(self) -> RestrictedServerConfig:
+        return self._config
+
+    @property
+    def handlers(self) -> WriteHandlers:
+        return self._handlers
+
+    @property
+    def interrupt_fired(self) -> bool:
+        return self._interrupt_flag
+
+    # -- Signal handling ---------------------------------------------------
+
+    def _install_signal_handlers(self) -> None:
+        """Set ESC/Ctrl-C to flip interrupt flag immediately."""
+        def _sig_handler(signum, frame):
+            logger.warning(
+                "RestrictedMCPServer: signal %s caught — interrupt fired", signum
+            )
+            self._interrupt_flag = True
+
+        try:
+            signal.signal(signal.SIGINT, _sig_handler)
+            if hasattr(signal, "SIGTERM"):
+                signal.signal(signal.SIGTERM, _sig_handler)
+        except (ValueError, OSError):
+            # Not in main thread (e.g. pytest); skip
+            logger.debug("signal handlers not installed (non-main thread)")
+
+    def check_interrupt(self) -> bool:
+        """Called by ExecutionGateway to query interrupt state."""
+        return self._interrupt_flag
+
+    # -- MCP tool registration ---------------------------------------------
+
+    def _build_mcp(self, mcp_factory: Optional[Any]) -> Any:
+        """Build the FastMCP instance and register tools.
+
+        If mcp_factory is provided (testing), use it; else import FastMCP.
+        """
+        if mcp_factory is not None:
+            mcp = mcp_factory("jcpr-restricted")
+        else:
+            try:
+                from mcp.server.fastmcp import FastMCP
+                mcp = FastMCP("jcpr-restricted")
+            except ImportError:
+                logger.error(
+                    "FastMCP (mcp package) not installed; install with "
+                    "'pip install mcp' before running the restricted server"
+                )
+                raise
+
+        self._register_tools(mcp)
+        return mcp
+
+    def _register_tools(self, mcp: Any) -> None:
+        """Register all 8 exposed write tools — internal handlers excluded."""
+        h = self._handlers
+
+        # Track exposed tool names for status_snapshot(). The list is
+        # populated below as each @mcp.tool() decorator runs; this is
+        # the single source of truth for "what's reachable from the
+        # outside" rather than hardcoding a count or list elsewhere.
+        # Internal CLI handlers (approve_action, reject_action) are
+        # intentionally NOT added here — they are not registered with
+        # the MCP transport at all.
+        self._tool_names: list[str] = []
+        _expose = self._tool_names.append
+
+        # Each tool wraps the handler with error-to-dict conversion. We
+        # avoid re-raising so the LLM agent gets a structured error rather
+        # than a raw Python traceback.
+
+        @mcp.tool()
+        def request_submit_order(
+            symbol: str,
+            side: str,
+            quantity: str,
+            order_type: str,
+            requested_by: str,
+            limit_price: Optional[str] = None,
+            time_in_force: str = "DAY",
+            client_order_id: Optional[str] = None,
+            strategy_id: Optional[str] = None,
+        ) -> dict[str, Any]:
+            return self._safe_call(
+                h.request_submit_order,
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                order_type=order_type,
+                limit_price=limit_price,
+                time_in_force=time_in_force,
+                client_order_id=client_order_id,
+                strategy_id=strategy_id,
+                requested_by=requested_by,
+            )
+
+        @mcp.tool()
+        def request_cancel_order(
+            broker_order_id: str,
+            symbol: str,
+            requested_by: str,
+        ) -> dict[str, Any]:
+            return self._safe_call(
+                h.request_cancel_order,
+                broker_order_id=broker_order_id,
+                symbol=symbol,
+                requested_by=requested_by,
+            )
+
+        @mcp.tool()
+        def request_set_capacity(
+            new_capacity_krw: str,
+            rationale: str,
+            requested_by: str,
+        ) -> dict[str, Any]:
+            return self._safe_call(
+                h.request_set_capacity,
+                new_capacity_krw=new_capacity_krw,
+                rationale=rationale,
+                requested_by=requested_by,
+            )
+
+        @mcp.tool()
+        def request_kill_switch(
+            reason: str,
+            requested_by: str,
+        ) -> dict[str, Any]:
+            return self._safe_call(
+                h.request_kill_switch,
+                reason=reason,
+                requested_by=requested_by,
+            )
+
+        @mcp.tool()
+        def list_pending_approvals(
+            requested_by: Optional[str] = None,
+            limit: int = 50,
+        ) -> dict[str, Any]:
+            return self._safe_call(
+                h.list_pending_approvals,
+                requested_by=requested_by,
+                limit=limit,
+            )
+
+        @mcp.tool()
+        def get_approval_detail(approval_id: str) -> dict[str, Any]:
+            return self._safe_call(h.get_approval_detail, approval_id=approval_id)
+
+        @mcp.tool()
+        def cancel_proposed_action(
+            approval_id: str,
+            actor: str,
+            reason: str = "cancelled by requester",
+        ) -> dict[str, Any]:
+            return self._safe_call(
+                h.cancel_proposed_action,
+                approval_id=approval_id,
+                actor=actor,
+                reason=reason,
+            )
+
+        @mcp.tool()
+        def execute_approved_action(
+            approval_id: str,
+            actor: str,
+        ) -> dict[str, Any]:
+            return self._safe_call(
+                h.execute_approved_action,
+                approval_id=approval_id,
+                actor=actor,
+            )
+
+        # Record the 8 exposed tool names — single source for
+        # status_snapshot().tools. Order matches registration order
+        # above. Internal handlers (approve_action, reject_action)
+        # are deliberately absent from this list and from the MCP
+        # transport.
+        for _name in (
+            "request_submit_order",
+            "request_cancel_order",
+            "request_set_capacity",
+            "request_kill_switch",
+            "list_pending_approvals",
+            "get_approval_detail",
+            "cancel_proposed_action",
+            "execute_approved_action",
+        ):
+            _expose(_name)
+
+    # -- Status snapshot ---------------------------------------------------
+
+    def status_snapshot(self) -> dict[str, Any]:
+        """Read-only operational snapshot.
+
+        Returns the server-level mode/allow_live, the interrupt flag,
+        a nested gateway snapshot (broker class names + kill-switch
+        state — no instances, no payloads), and the list of 8 exposed
+        tool names. Does NOT include any secrets, approval payloads,
+        order details, or broker credentials. Safe to log and to
+        return to test harnesses.
+
+        The `tools` field is sourced from `_tool_names`, which is
+        populated by `_register_tools` — this is the single source of
+        truth for what is reachable via the MCP transport.
+        """
+        gw_snap: Optional[dict] = None
+        if hasattr(self._gateway, "status_snapshot"):
+            try:
+                gw_snap = self._gateway.status_snapshot()
+            except Exception:  # pragma: no cover — defensive
+                gw_snap = None
+
+        return {
+            "mode": self._config.mode,
+            "allow_live": self._config.allow_live,
+            "interrupt_fired": self._interrupt_flag,
+            "gateway": gw_snap,
+            "tools": list(getattr(self, "_tool_names", [])),
+        }
+
+    # -- call_tool dispatch (Phase 2-B) ------------------------------------
+
+    # Tool name aliases — test-friendly names mapped to canonical
+    # WriteHandlers method names. Single source of truth for the
+    # public-facing tool vocabulary; keep in sync with _PAYLOAD_KEYS.
+    # Internal CLI handlers (approve_action, reject_action) are NOT
+    # aliased — call_tool cannot reach them.
+    _TOOL_ALIASES: dict[str, str] = {
+        # Phase 2-B test names → canonical WriteHandlers method names
+        "propose_submit_order":   "request_submit_order",
+        "propose_cancel_order":   "request_cancel_order",
+        "propose_set_capacity":   "request_set_capacity",
+        "propose_kill_switch":    "request_kill_switch",
+        "list_pending":           "list_pending_approvals",
+        "query_approval_status":  "get_approval_detail",
+        "cancel_proposal":        "cancel_proposed_action",
+        "execute_approved":       "execute_approved_action",
+        # Identity mappings — canonical names also accepted
+        "request_submit_order":   "request_submit_order",
+        "request_cancel_order":   "request_cancel_order",
+        "request_set_capacity":   "request_set_capacity",
+        "request_kill_switch":    "request_kill_switch",
+        "list_pending_approvals": "list_pending_approvals",
+        "get_approval_detail":    "get_approval_detail",
+        "cancel_proposed_action": "cancel_proposed_action",
+        "execute_approved_action":"execute_approved_action",
+    }
+
+    # Per-tool whitelist of payload keys accepted via the `payload=`
+    # argument to call_tool. Defense against silent key pass-through:
+    # an unknown key yields error_kind='handler' rather than reaching
+    # the underlying handler with surprising kwargs. Empty tuple means
+    # "no payload-style invocation supported — use direct kwargs".
+    _PAYLOAD_KEYS: dict[str, tuple[str, ...]] = {
+        "propose_submit_order": (
+            "symbol", "side", "quantity", "qty", "order_type",
+            "limit_price", "time_in_force", "client_order_id", "strategy_id",
+        ),
+        "propose_cancel_order": ("broker_order_id", "symbol"),
+        "propose_set_capacity": ("new_capacity_krw", "rationale"),
+        "propose_kill_switch":  ("reason",),
+    }
+
+    def call_tool(self, name: str, *,
+                  payload: Optional[dict] = None,
+                  **kwargs) -> ToolResponse:
+        """Dispatch a tool by name and return a ToolResponse object.
+
+        This is a higher-level test/CLI entry point that runs alongside
+        the @mcp.tool() decorator path used by the LLM agent transport.
+        Both paths funnel through WriteHandlers and respect identical
+        validation; only the response shape differs:
+            - @mcp.tool() decorators return dict (LLM-consumable JSON)
+            - call_tool() returns ToolResponse (attribute-access object)
+
+        Parameters:
+            name      — tool name (alias or canonical, see _TOOL_ALIASES)
+            payload   — optional dict of fields, validated against
+                        _PAYLOAD_KEYS for the named tool. Unknown keys
+                        produce error_kind='handler' WITHOUT calling
+                        the underlying handler.
+            **kwargs  — direct keyword arguments (merged after payload).
+
+        Special handling:
+            - "qty" → "quantity" normalization (test convention)
+            - "cancel_proposal": requires requested_by; performs an
+              identity check against the original record.requested_by.
+              Mismatch yields error_kind='identity'.
+
+        Returns ToolResponse — never raises.
+        """
+        # Resolve alias
+        target = self._TOOL_ALIASES.get(name)
+        if target is None:
+            return ToolResponse(
+                ok=False, error_kind="handler",
+                message=f"unknown tool: {name!r}"
+            )
+
+        # Merge payload into kwargs with whitelist enforcement
+        if payload is not None:
+            allowed = set(self._PAYLOAD_KEYS.get(name, ()))
+            if not allowed:
+                return ToolResponse(
+                    ok=False, error_kind="handler",
+                    message=f"tool {name!r} does not accept payload= invocation"
+                )
+            for k, v in payload.items():
+                if k not in allowed:
+                    return ToolResponse(
+                        ok=False, error_kind="handler",
+                        message=f"unknown payload key for {name!r}: {k!r}"
+                    )
+                # Test convention normalizations:
+                if k == "qty":
+                    # qty (int) → quantity (str expected by handler)
+                    kwargs.setdefault("quantity", str(v))
+                elif k == "limit_price" and v is not None:
+                    kwargs.setdefault("limit_price", str(v))
+                else:
+                    kwargs.setdefault(k, v)
+
+        # Identity check for cancel_proposal — paper_system fixture
+        # requires that only the original requester can cancel.
+        if name == "cancel_proposal":
+            requested_by = kwargs.pop("requested_by", None)
+            aid = kwargs.get("approval_id")
+            if requested_by is None or aid is None:
+                return ToolResponse(
+                    ok=False, error_kind="handler",
+                    message="cancel_proposal requires approval_id and requested_by"
+                )
+            try:
+                rec = self._store.get(aid)
+            except Exception as exc:
+                return ToolResponse(
+                    ok=False, error_kind="handler", message=str(exc)
+                )
+            if rec.requested_by != requested_by:
+                # Identity violation — distinct error_kind so callers
+                # can reliably distinguish authz failure from other
+                # handler errors.
+                return ToolResponse(
+                    ok=False, error_kind="identity",
+                    message=(
+                        f"only original requester {rec.requested_by!r} "
+                        f"may cancel; got {requested_by!r}"
+                    )
+                )
+            kwargs["actor"] = requested_by
+            kwargs.setdefault("reason", "cancelled by requester")
+
+        # Dispatch via the corresponding handler method
+        handler_method = getattr(self._handlers, target, None)
+        if handler_method is None:
+            return ToolResponse(
+                ok=False, error_kind="handler",
+                message=f"handler {target!r} not found on WriteHandlers"
+            )
+        return self._call_via_handler(handler_method, **kwargs)
+
+    def _call_via_handler(self, func, **kwargs) -> ToolResponse:
+        """Object-shaped sibling of _safe_call — same exception mapping.
+
+        Kept separate from _safe_call so the @mcp.tool() decorator path
+        (LLM transport) continues to receive dict envelopes unchanged.
+        """
+        try:
+            return ToolResponse(ok=True, result=func(**kwargs))
+        except WriteHandlerError as exc:
+            return ToolResponse(
+                ok=False, error_kind="handler", message=str(exc)
+            )
+        except ApprovalStoreError as exc:
+            return ToolResponse(
+                ok=False, error_kind="approval_store", message=str(exc)
+            )
+        except GatewayError as exc:
+            return ToolResponse(
+                ok=False, error_kind="gateway", message=str(exc)
+            )
+        except Exception as exc:  # last-resort safety
+            logger.exception("unexpected error in handler %s", func.__name__)
+            return ToolResponse(
+                ok=False, error_kind="internal",
+                message=f"{type(exc).__name__}: {exc}",
+            )
+
+    # -- Error mapping -----------------------------------------------------
+
+    def _safe_call(self, func, **kwargs) -> dict[str, Any]:
+        """Call handler and convert exceptions to structured error dicts."""
+        try:
+            return {"ok": True, "result": func(**kwargs)}
+        except WriteHandlerError as exc:
+            return {"ok": False, "error_kind": "handler", "message": str(exc)}
+        except ApprovalStoreError as exc:
+            return {"ok": False, "error_kind": "approval_store", "message": str(exc)}
+        except GatewayError as exc:
+            return {"ok": False, "error_kind": "gateway", "message": str(exc)}
+        except Exception as exc:  # last-resort safety
+            logger.exception("unexpected error in handler %s", func.__name__)
+            return {
+                "ok": False,
+                "error_kind": "internal",
+                "message": f"{type(exc).__name__}: {exc}",
+            }
+
+    # -- Lifecycle ---------------------------------------------------------
+
+    def run(self) -> None:
+        """Start the MCP stdio transport (blocking)."""
+        logger.info(
+            "RestrictedMCPServer starting: mode=%s db=%s allow_live=%s",
+            self._config.mode,
+            self._config.approval_db_path,
+            self._config.allow_live,
+        )
+        self._mcp.run(transport="stdio")
+
+    def close(self) -> None:
+        """Release resources (store + broker session, if any)."""
+        try:
+            getattr(self._store, "close", lambda: None)()
+        except Exception as exc:  # pragma: no cover
+            logger.warning("store close failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Builder
+# ---------------------------------------------------------------------------
+
+def build_server(
+    *,
+    config: Optional[RestrictedServerConfig] = None,
+    broker: Optional[Any] = None,
+    paper_broker: Optional[Any] = None,
+    live_broker: Optional[Any] = None,
+    audit_writer: Optional[Any] = None,
+    mcp_factory: Optional[Any] = None,
+) -> RestrictedMCPServer:
+    """Build a fully wired RestrictedMCPServer.
+
+    Caller must supply the broker(s). Two configurations are supported:
+        (a) Legacy single-broker:   broker=...
+        (b) Dual-broker routing:    paper_broker=..., live_broker=...
+
+    For unit tests, inject mock broker(s) + mcp_factory.
+    """
+    cfg = config if config is not None else load_restricted_config()
+
+    # Determine broker configuration:
+    # - If neither single nor dual brokers given, build the real KIS
+    #   adapter from .env (production path).
+    # - If only single `broker=` given, pass through (legacy path).
+    # - If `paper_broker`/`live_broker` given, use dual routing — the
+    #   ExecutionGateway will reject the (broker, paper_broker) mix.
+    has_dual = (paper_broker is not None) or (live_broker is not None)
+    if not has_dual and broker is None:
+        broker = _build_default_broker(cfg)
+
+    # Build the unified ApprovalStore (Phase 1)
+    store = ApprovalStore(db_path=cfg.approval_db_path)
+
+    # Build the gateway, sharing the same store
+    # interrupt_check is set later via server reference (chicken-and-egg)
+    if has_dual:
+        gateway = ExecutionGateway(
+            store=store,
+            paper_broker=paper_broker,
+            live_broker=live_broker,
+            mode=cfg.mode,
+            allow_live=cfg.allow_live,
+            audit_writer=audit_writer,
+        )
+    else:
+        gateway = ExecutionGateway(
+            approval_store=store,
+            broker=broker,
+            mode=cfg.mode,
+            allow_live=cfg.allow_live,
+            audit_writer=audit_writer,
+        )
+
+    # Build handlers
+    handlers = build_handlers(
+        store=store,
+        gateway=gateway,
+        operator_id=cfg.operator_id,
+        proposal_ttl=cfg.proposal_ttl_seconds,
+        execution_ttl=cfg.execution_ttl_seconds,
+        kill_switch_ttl=cfg.kill_switch_ttl_seconds,
+    )
+
+    server = RestrictedMCPServer(
+        config=cfg,
+        store=store,
+        gateway=gateway,
+        handlers=handlers,
+        mcp_factory=mcp_factory,
+    )
+
+    # Wire interrupt_check now that server exists
+    gateway._interrupt_check = server.check_interrupt
+
+    return server
+
+
+def _build_default_broker(cfg: RestrictedServerConfig) -> Any:
+    """Construct the KIS execution adapter from .env."""
+    try:
+        from src.brokers.kis_execution import KISExecutionAdapter
+        from src.brokers._secrets import load_kis_secrets
+    except ImportError as exc:
+        raise RuntimeError(
+            "KIS broker modules unavailable; cannot build default broker"
+        ) from exc
+
+    secrets = load_kis_secrets(mode=cfg.mode, allow_live=cfg.allow_live)
+    return KISExecutionAdapter(secrets=secrets, mode=cfg.mode)
+
+
+# ---------------------------------------------------------------------------
+# Naming aliases
+# ---------------------------------------------------------------------------
+
+# Aliases for naming consistency. Both names refer to the same class /
+# function — `RestrictedServer` and `build_restricted_server` are the
+# simpler names preferred by integration tests and top-level wiring
+# (e.g. tests/integration/test_phase2b_end_to_end.py); the canonical
+# names `RestrictedMCPServer` and `build_server` are retained for
+# backward compatibility and for callers that prefer the explicit MCP
+# qualifier. Either may be imported, instantiated, or used in
+# isinstance() checks — they are the same objects.
+RestrictedServer = RestrictedMCPServer
+build_restricted_server = build_server
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    """CLI entrypoint. Loads config from env, builds server, runs."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+    server = None
+    try:
+        server = build_server()
+        server.run()
+        return 0
+    except KeyboardInterrupt:
+        logger.warning("KeyboardInterrupt — shutting down")
+        return 130
+    except Exception as exc:
+        logger.exception("server failed: %s", exc)
+        return 1
+    finally:
+        if server is not None:
+            server.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

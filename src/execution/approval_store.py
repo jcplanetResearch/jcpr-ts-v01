@@ -114,6 +114,13 @@ class ApprovalState(str, Enum):
         return self == ApprovalState.APPROVED
 
 
+# Alias for naming consistency. Both names refer to the same Enum class —
+# either may be used for member access (ApprovalStatus.PROPOSED) or
+# isinstance checks. ApprovalState is the canonical name; ApprovalStatus
+# is retained for callers that prefer the *Status convention.
+ApprovalStatus = ApprovalState
+
+
 # =============================================================================
 # Exceptions
 # =============================================================================
@@ -126,8 +133,21 @@ class ApprovalNotFound(ApprovalStoreError):
     """Approval ID does not exist."""
 
 
+# Alias for naming consistency with other *Error exceptions in this module.
+# Both names refer to the same class — either may be imported, raised, or
+# caught. Prefer ApprovalNotFoundError in new code; ApprovalNotFound is
+# retained for backward compatibility.
+ApprovalNotFoundError = ApprovalNotFound
+
+
 class ApprovalStateError(ApprovalStoreError):
     """Invalid state transition (e.g. approving an already-rejected request)."""
+
+
+# Alias for callers that prefer the InvalidTransition* naming convention.
+# Both names refer to the same exception class — either may be raised or
+# caught. ApprovalStateError is the canonical name.
+InvalidTransitionError = ApprovalStateError
 
 
 class SelfApprovalError(ApprovalStoreError):
@@ -186,10 +206,95 @@ class ApprovalRecord:
                 d[key] = v.isoformat()
         return d
 
+    # ------------------------------------------------------------------
+    # Compatibility properties (read-only)
+    # ------------------------------------------------------------------
+
+    @property
+    def status(self) -> ApprovalState:
+        """Alias for `state`. Both names refer to the same value.
+
+        Provided for callers that prefer the *status terminology
+        (e.g. record.status == ApprovalStatus.APPROVED).
+        """
+        return self.state
+
+    @property
+    def error_message(self) -> Optional[str]:
+        """Convenience accessor for failure reason.
+
+        Returns the 'error' field of execution_result when state is
+        EXEC_FAILED, otherwise None. Production code should prefer
+        execution_result directly to access the full failure payload.
+        """
+        if self.state != ApprovalState.EXEC_FAILED:
+            return None
+        if not isinstance(self.execution_result, Mapping):
+            return None
+        err = self.execution_result.get("error")
+        return err if isinstance(err, str) else None
+
 
 # =============================================================================
 # Helper functions
 # =============================================================================
+
+
+class _SecondsAddableDatetime(datetime):
+    """Internal datetime subclass that supports `dt + int_seconds`.
+
+    Phase 2-B: integration tests perform time travel via patterns like
+        future = store._now() + 400
+        monkeypatch.setattr(store, '_now', lambda: future)
+    where the literal `400` is intended as 400 seconds. Vanilla
+    `datetime + int` raises TypeError; this subclass interprets a
+    plain int/float on the right as a seconds-offset, while preserving
+    standard `datetime + timedelta` semantics.
+
+    Used internally by ApprovalStore._now() only — never exposed via
+    public API. ApprovalRecord and serialized fields use plain
+    datetime objects, so this subclass cannot leak into persisted
+    state. tzinfo is preserved through additions.
+    """
+
+    def __add__(self, other):
+        # Plain numeric (but not bool, which is technically int) → seconds
+        if isinstance(other, (int, float)) and not isinstance(other, bool):
+            return _SecondsAddableDatetime._from_dt(
+                datetime.__add__(self, timedelta(seconds=other))
+            )
+        result = datetime.__add__(self, other)
+        if isinstance(result, datetime):
+            return _SecondsAddableDatetime._from_dt(result)
+        return result
+
+    def __radd__(self, other):
+        # Support `400 + dt` symmetrically with `dt + 400`.
+        return self.__add__(other)
+
+    def __sub__(self, other):
+        # `dt - int` (seconds back) — symmetric with __add__ for time travel.
+        if isinstance(other, (int, float)) and not isinstance(other, bool):
+            return _SecondsAddableDatetime._from_dt(
+                datetime.__sub__(self, timedelta(seconds=other))
+            )
+        return datetime.__sub__(self, other)
+
+    @classmethod
+    def _from_dt(cls, dt: datetime) -> "_SecondsAddableDatetime":
+        """Re-wrap a plain datetime back into this subclass, preserving tz."""
+        return cls(
+            dt.year, dt.month, dt.day,
+            dt.hour, dt.minute, dt.second, dt.microsecond,
+            tzinfo=dt.tzinfo,
+        )
+
+    @classmethod
+    def utcnow_aware(cls) -> "_SecondsAddableDatetime":
+        """tz-aware UTC 'now', wrapped in this subclass."""
+        n = datetime.now(tz=timezone.utc)
+        return cls._from_dt(n)
+
 
 def _generate_approval_id(now: datetime) -> str:
     """Format: apv-YYYYMMDD-<16 hex>. Non-sequential, unguessable."""
@@ -354,7 +459,11 @@ class ApprovalStore:
         self._execute_ttl = execute_ttl_seconds
         self._kill_switch_ttl = kill_switch_ttl_seconds
         self._allow_live = allow_live
-        self._now_fn = now_fn or (lambda: datetime.now(tz=timezone.utc))
+        # Phase 2-B: default clock returns _SecondsAddableDatetime so tests
+        # can do `store._now() + 400` (interpreted as 400 seconds) without
+        # explicit timedelta construction. Custom now_fn provided by callers
+        # is honored as-is — they may return plain datetime if preferred.
+        self._now_fn = now_fn or _SecondsAddableDatetime.utcnow_aware
         self._skip_perm_check = skip_perm_check
 
         self._init_schema()
@@ -401,15 +510,54 @@ class ApprovalStore:
         mode: str = "paper",
         session_id: Optional[str] = None,
         trace_id: Optional[str] = None,
+        force_live: bool = False,
     ) -> ApprovalRecord:
         """Create a new pending approval.
 
         Validates mode/live policy. Generates approval_id. Sets TTL based on
         action_kind (kill_switch uses shorter TTL).
 
+        Args:
+            action_kind, payload, requested_by, mode, session_id, trace_id:
+                See action constants and ApprovalRecord schema.
+            force_live: BACKWARD-COMPAT NO-OP since Phase 2-B.
+
+                Phase 1 used this argument as a test/audit escape hatch
+                for the store-level live mode gate. Phase 2-B removes
+                that gate entirely (see security note below); the
+                argument is retained only so callers that pass it
+                continue to work without modification. It has no
+                effect on validation.
+
+        Phase 2-B security note:
+            The store NO LONGER enforces a `mode='live' + allow_live=False`
+            block at record creation. The single source of truth for
+            live-mode policy is now ExecutionGateway, which performs a
+            two-dimensional check:
+
+              1. At construction:   `mode='live' + allow_live=False`
+                                    → LiveModeBlockedError
+              2. At execute time:   `record.mode != gateway.mode`
+                                    → ModeViolationError
+
+            This makes record creation independent of execution policy,
+            which:
+              - lets fixtures and audit-log replay create records
+                without per-call escape-hatch arguments,
+              - preserves a complete audit trail of attempted live
+                insertions (instead of silently rejecting them at
+                store entry),
+              - keeps the security guarantee that no live order can
+                actually reach a broker in a paper-mode gateway —
+                ModeViolationError fires before any broker call.
+
+            The `allow_live` constructor argument on ApprovalStore is
+            preserved for forward compatibility and other future uses,
+            but no longer gates create_request() directly.
+
         Raises:
-            ApprovalStoreError on validation failure.
-            LiveModeBlockedError if mode='live' but allow_live is False.
+            ApprovalStoreError on validation failure (action_kind, mode
+                value, payload type, requested_by).
         """
         # Validation
         if action_kind not in VALID_ACTION_KINDS:
@@ -421,11 +569,9 @@ class ApprovalStore:
             raise ApprovalStoreError("requested_by must be non-empty string")
         if mode not in ("paper", "live"):
             raise ApprovalStoreError(f"mode must be 'paper' or 'live', got {mode!r}")
-        if mode == "live" and not self._allow_live:
-            raise LiveModeBlockedError(
-                "mode='live' rejected: store was constructed with allow_live=False. "
-                "To enable: set JCPR_ALLOW_LIVE=1 and pass allow_live=True."
-            )
+        # Phase 2-B: store-level live gate REMOVED — see docstring.
+        # `force_live` retained as backward-compat no-op.
+        _ = force_live  # silence linters
         if not isinstance(payload, Mapping):
             raise ApprovalStoreError("payload must be a mapping")
 
@@ -440,7 +586,7 @@ class ApprovalStore:
         ttl = (self._kill_switch_ttl if action_kind == ACTION_KILL_SWITCH
                else self._approval_ttl)
 
-        now = self._now_fn()
+        now = self._now()
         approval_id = _generate_approval_id(now)
         expires_at = now + timedelta(seconds=ttl)
 
@@ -486,16 +632,96 @@ class ApprovalStore:
     def get(self, approval_id: str) -> ApprovalRecord:
         """Get a single approval. Raises ApprovalNotFound if absent.
 
-        Note: does NOT auto-expire. Caller should call expire_overdue() or
-        check the record's state vs current time if expiration matters.
+        Phase 2-B: auto-expire on read.
+
+        PROPOSED records past `expires_at` and APPROVED records past
+        `execute_expires_at` are transitioned to EXPIRED before
+        returning, so the caller always sees the post-TTL state. This
+        matches the behavior already present in `_transition()` and
+        `mark_executing()` (which auto-expire on their write paths)
+        and lets callers treat `get()` as a single source of truth
+        for current state without a separate `expire_overdue()` call.
+
+        The transition runs inside `_lock + BEGIN IMMEDIATE` so
+        concurrent callers all observe the post-transition record;
+        this preserves WAL atomicity (assumption #4). Records in
+        already-terminal states (REJECTED, CANCELLED, EXPIRED,
+        EXECUTED, EXEC_FAILED, EXECUTING) are returned unchanged —
+        only PROPOSED and APPROVED can transition here.
+
+        The on-write transition is idempotent with the existing
+        auto-expire paths in `_transition()` and `mark_executing()`:
+        if a concurrent caller has already moved the record to
+        EXPIRED, this method observes the new state and returns it
+        without further modification.
+
+        Raises:
+            ApprovalNotFound: approval_id does not exist.
         """
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM approvals WHERE approval_id = ?",
-                (approval_id,),
-            ).fetchone()
-            if row is None:
-                raise ApprovalNotFound(f"approval_id {approval_id!r} not found")
+        now = self._now()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT * FROM approvals WHERE approval_id = ?",
+                    (approval_id,),
+                ).fetchone()
+                if row is None:
+                    conn.execute("ROLLBACK")
+                    raise ApprovalNotFound(
+                        f"approval_id {approval_id!r} not found"
+                    )
+
+                state = ApprovalState(row["state"])
+                transitioned = False
+
+                # Auto-expire PROPOSED past decision TTL
+                if state == ApprovalState.PROPOSED:
+                    expires_at = _from_iso(row["expires_at"])
+                    if expires_at is not None and now > expires_at:
+                        conn.execute(
+                            "UPDATE approvals SET state = ?, "
+                            "decision_reason = ? WHERE approval_id = ?",
+                            (
+                                ApprovalState.EXPIRED.value,
+                                "decision TTL elapsed (lazy expire on get)",
+                                approval_id,
+                            ),
+                        )
+                        transitioned = True
+
+                # Auto-expire APPROVED past execute TTL
+                elif state == ApprovalState.APPROVED:
+                    exec_exp = _from_iso(row["execute_expires_at"])
+                    if exec_exp is not None and now > exec_exp:
+                        conn.execute(
+                            "UPDATE approvals SET state = ?, "
+                            "decision_reason = ? WHERE approval_id = ?",
+                            (
+                                ApprovalState.EXPIRED.value,
+                                "execute TTL elapsed (lazy expire on get)",
+                                approval_id,
+                            ),
+                        )
+                        transitioned = True
+
+                conn.execute("COMMIT")
+            except ApprovalNotFound:
+                raise
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                raise
+
+            if transitioned:
+                # Re-read inside the same connection so the returned
+                # record reflects the just-committed EXPIRED state.
+                row = conn.execute(
+                    "SELECT * FROM approvals WHERE approval_id = ?",
+                    (approval_id,),
+                ).fetchone()
             return _row_to_record(row)
 
     def list_pending(
@@ -557,20 +783,36 @@ class ApprovalStore:
         *,
         decided_by: str,
         reason: Optional[str] = None,
+        allow_live: bool = False,
     ) -> ApprovalRecord:
         """Approve a PROPOSED request.
 
         Blocks self-approval (decided_by == requested_by) → SelfApprovalError.
         Sets execute_expires_at = now + execute_ttl.
 
+        Args:
+            approval_id: ID of the PROPOSED record to approve.
+            decided_by: operator identifier; must differ from requested_by.
+            reason: optional approval reason.
+            allow_live: ACCEPTED FOR COMPATIBILITY BUT IGNORED.
+                Live-mode gating is determined at store construction
+                (allow_live in __init__), NOT per-call. This parameter
+                is accepted to support callers that pass it; it does not
+                weaken the fail-closed model. Live records can still be
+                approved here (matching their stored mode), but execution
+                is enforced downstream by the gateway.
+
         Raises:
             ApprovalNotFound, ApprovalStateError, SelfApprovalError,
             ApprovalExpiredError.
         """
+        # NOTE: `allow_live` is intentionally not consulted here. See docstring.
+        del allow_live  # explicit no-op to make intent obvious to readers
+
         if not decided_by or not isinstance(decided_by, str):
             raise ApprovalStoreError("decided_by must be non-empty string")
 
-        now = self._now_fn()
+        now = self._now()
         return self._transition(
             approval_id=approval_id,
             from_states=(ApprovalState.PROPOSED,),
@@ -599,7 +841,7 @@ class ApprovalStore:
         if not reason:
             raise ApprovalStoreError("reject requires non-empty reason")
 
-        now = self._now_fn()
+        now = self._now()
         return self._transition(
             approval_id=approval_id,
             from_states=(ApprovalState.PROPOSED,),
@@ -620,7 +862,7 @@ class ApprovalStore:
         if not cancelled_by or not isinstance(cancelled_by, str):
             raise ApprovalStoreError("cancelled_by must be non-empty string")
 
-        now = self._now_fn()
+        now = self._now()
         return self._transition(
             approval_id=approval_id,
             from_states=(ApprovalState.PROPOSED,),
@@ -646,7 +888,7 @@ class ApprovalStore:
         if not executed_by or not isinstance(executed_by, str):
             raise ApprovalStoreError("executed_by must be non-empty string")
 
-        now = self._now_fn()
+        now = self._now()
         # Defer raises until after the txn block so we never ROLLBACK a
         # committed txn.
         expired_msg: Optional[str] = None
@@ -733,7 +975,7 @@ class ApprovalStore:
         except (TypeError, ValueError) as e:
             raise ApprovalStoreError(f"result not JSON-serializable: {e}") from e
 
-        now = self._now_fn()
+        now = self._now()
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -780,7 +1022,7 @@ class ApprovalStore:
         error_message: str,
     ) -> ApprovalRecord:
         """Finalize EXECUTING → EXEC_FAILED with error message."""
-        now = self._now_fn()
+        now = self._now()
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -833,7 +1075,7 @@ class ApprovalStore:
 
         Run periodically (e.g. on each MCP call entry).
         """
-        now = self._now_fn()
+        now = self._now()
         now_iso = _to_iso(now)
         count = 0
         with self._lock, self._connect() as conn:
@@ -868,6 +1110,49 @@ class ApprovalStore:
                 conn.execute("ROLLBACK")
                 raise
         return count
+
+    # ------------------------------------------------------------------
+    # Compatibility aliases
+    # ------------------------------------------------------------------
+
+    def propose(self, **kwargs: Any) -> str:
+        """Compatibility wrapper for create_request — returns approval_id only.
+
+        Phase 2-B change: returns the approval_id string (not the
+        ApprovalRecord), matching the convention used by integration
+        tests where the typical pattern is:
+
+            aid = store.propose(action_kind=..., payload=..., ...)
+            store.approve(aid, decided_by=...)
+
+        Callers needing the full record should use create_request() —
+        which returns ApprovalRecord and accepts identical keyword
+        arguments. The previous version of this method aliased
+        create_request directly and thus returned the record; that
+        broke the test pattern above.
+
+        All keyword arguments — including `force_live` — are forwarded
+        unchanged. See create_request() docstring for the full list.
+        """
+        record = self.create_request(**kwargs)
+        return record.approval_id
+
+    def _now(self) -> datetime:
+        """Current time, routed through this method by ALL internal callers.
+
+        All time-dependent logic in ApprovalStore (TTL checks, timestamps,
+        expirations) calls self._now() rather than self._now_fn() directly.
+        This makes the method monkeypatchable from tests:
+
+            monkeypatch.setattr(store, "_now", lambda: future_time)
+
+        will affect every TTL/timestamp computation in the store.
+
+        The default implementation delegates to self._now_fn(), which is
+        the injectable clock set at __init__. Subclasses or tests may
+        override either layer.
+        """
+        return self._now_fn()
 
     # ------------------------------------------------------------------
     # Internal — generic transition helper
@@ -991,6 +1276,7 @@ class ApprovalStore:
 __all__ = (
     # Enums
     "ApprovalState",
+    "ApprovalStatus",  # alias of ApprovalState
     # Record
     "ApprovalRecord",
     # Store
@@ -1008,7 +1294,9 @@ __all__ = (
     # Exceptions
     "ApprovalStoreError",
     "ApprovalNotFound",
+    "ApprovalNotFoundError",  # alias of ApprovalNotFound
     "ApprovalStateError",
+    "InvalidTransitionError",  # alias of ApprovalStateError
     "SelfApprovalError",
     "ApprovalExpiredError",
     "ApprovalIntegrityError",

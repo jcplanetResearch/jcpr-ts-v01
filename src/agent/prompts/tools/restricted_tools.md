@@ -1,128 +1,150 @@
 ---
-template_id: common.restricted_tools
-version: v1.0
-role: tool_guide
-target_agent: common
-description: "Reference for the 8 restricted (write) MCP tools — all require human approval."
-required_variables: []
+template_id: restricted_tools
+template_version: 0.2.0
+last_updated: 2026-05-08
+phase: 2
+audience: agent_llm
 ---
 
-# JCPR Restricted MCP Tools Reference
+# Restricted MCP Tools (Write) — JCPR Trading System
 
-The restricted MCP server (`jcpr-restricted`, Task 35) provides 8 tools that change state. **EVERY ACTION REQUIRES HUMAN APPROVAL.** You cannot bypass this.
+You have access to **8 write tools** through the JCPR restricted MCP server.
+These tools mutate state — orders, capacity, kill-switch — and therefore
+require **operator approval** before any effect reaches the brokerage API.
 
-## 3-Phase Workflow
+## Workflow (Phase 2 — unified approval store)
 
 ```
-1. AGENT calls request_xxx(...)
-   → returns approval_id, status: "pending"
-
-2. OPERATOR (human) approves via CLI:
-   $ python scripts/approve_cli.py --approval-db ... \\
-       --approval-id <id> --approve --decided-by <name>
-
-3. AGENT calls execute_approved_action(approval_id)
-   → runs the action (currently stub for Task 21)
+agent → request_*  → ApprovalStore (PROPOSED)
+                          │
+                          ▼
+                   [operator review via approve_cli]
+                          │
+                          ▼
+                  ApprovalStore (APPROVED)
+                          │
+                          ▼
+agent → execute_approved_action → ExecutionGateway → KIS API
+                                                      │
+                                                      ▼
+                                       ApprovalStore (EXECUTED / EXEC_FAILED)
 ```
 
-## Hard Rules
+Phase 2 change vs prior version: `execute_approved_action` now performs the
+**real KIS API call** (paper or live, depending on server mode). The earlier
+stub-only behaviour is removed.
 
-1. **Self-approval is BLOCKED**: If you (`requested_by`) try to also approve, the system rejects (`SelfApprovalError`).
-2. **Default mode is paper**: Set `mode='paper'` (or omit). `mode='live'` requires server config `allow_live=True`.
-3. **TTLs are tight**: Approval TTL = 5 minutes (default). Execute TTL after approval = 60 seconds.
-4. **Single-use**: An approval can only be executed once.
-5. **All actions are audited**: `approval_request`, `approval_decision`, `mcp_tool_call`, `mcp_tool_result`.
+## Mandatory invariants — DO NOT violate these
 
-## Tools
+1. **Never self-approve.** `requested_by` (you) MUST differ from `decided_by`
+   (the operator). Self-approval is rejected at the store level. Do not
+   attempt to call `approve_action` — it is not exposed via MCP. Only
+   the operator's `approve_cli` can approve.
+
+2. **Always provide a unique `requested_by` actor id.** Use your role-based
+   id (e.g. `risk_explanation_agent`, `market_analyst_agent`). Generic ids
+   like `agent`, `operator`, `admin` are rejected.
+
+3. **No live mode without dual confirmation.** If the server is running in
+   paper mode (`mode='paper'`), all your requests apply to paper trading.
+   The operator can only put the server into live mode by setting
+   `JCPR_ALLOW_LIVE=1` AND `JCPR_MODE=live`. You cannot escalate.
+
+4. **Approvals expire.** Default proposal TTL is 5 minutes; kill-switch is
+   60 seconds. After expiry the approval is rejected automatically.
+
+5. **One approval per action.** Do not create duplicate proposals for the
+   same logical action. Use `list_pending_approvals` first to check if
+   one is already in flight.
+
+6. **ESC/Ctrl-C terminates immediately.** If the operator interrupts
+   during an `execute_approved_action`, the call will fail with an
+   InterruptedExecutionError; the approval transitions to EXEC_FAILED
+   with `error_message="interrupted by ESC/Ctrl-C"`.
+
+## Tool reference
 
 ### request_submit_order
-```
-symbol: str       (e.g. "005930")
-side: str         ("buy" or "sell")
-qty: int          (positive)
-order_type: str   ("market" | "limit", default "market")
-price_krw: str?   (required if order_type="limit")
-mode: str         ("paper" default)
-strategy_id: str? (optional attribution)
-client_order_id: str? (optional idempotency token)
-requested_by: str (your agent name)
-```
+Propose a new equity order. Returns `approval_id`.
+
+Required:
+- `symbol` (e.g. `005930` for Samsung Electronics)
+- `side` (`BUY` or `SELL`)
+- `quantity` (string-encoded integer; KRX trades whole shares)
+- `order_type` (`MARKET` or `LIMIT`)
+- `requested_by` (your role id)
+
+Optional:
+- `limit_price` (required if `order_type=LIMIT`; string-encoded Decimal)
+- `time_in_force` (`DAY` default)
+- `client_order_id` (auto-generated if omitted)
+- `strategy_id` (links this order to a Task 45 registry entry)
 
 ### request_cancel_order
-```
-order_id: str
-reason: str
-requested_by: str
-```
+Propose cancellation of a live working order.
+
+Required: `broker_order_id`, `symbol`, `requested_by`.
 
 ### request_set_capacity
-```
-capacity_krw: str    (Decimal string)
-target: str          ("total" or "per_strategy")
-strategy_id: str?    (required if target=per_strategy)
-reason: str
-requested_by: str
-```
+Propose a capacity (NAV ceiling) change. Required: `new_capacity_krw`
+(string Decimal, ≥0), `rationale` (≥10 chars), `requested_by`.
 
 ### request_kill_switch
-```
-activate: bool
-reason: str          (REQUIRED when activate=true)
-requested_by: str
-```
-URGENT — TTL is 60 seconds (vs 5min for others).
+Propose immediate kill-switch activation. Use ONLY when you observe a
+catastrophic anomaly (broker disconnect, runaway loss, suspected
+compromise). Required: `reason` (≥5 chars), `requested_by`.
+
+Note: kill_switch has a shorter TTL (60 s). It is the only action where
+self-approval by the operator is permitted by policy — but you, the agent,
+still cannot self-approve.
 
 ### list_pending_approvals
-```
-limit: int = 20      (max 100)
-```
-Returns: `{pending_approvals: [...], count: N}`
+Returns approvals in PROPOSED state. Use this to check if a duplicate is
+already in flight before submitting a new request.
 
-### get_approval_status
-```
-approval_id: str     ("apv-YYYYMMDD-XXXXXXXX")
-```
-Returns full approval record including `status`, `decided_by`, `expires_in_seconds`.
+### get_approval_detail
+Returns full record for one approval, including `action_payload` and
+`execution_payload` (if executed).
 
-### cancel_request
-```
-approval_id: str
-reason: str
-cancelled_by: str    (must match original requester)
-```
-Only YOU (the original requester) can cancel YOUR pending request. Cannot cancel approved/rejected/executed.
+### cancel_proposed_action
+Cancel a still-PROPOSED action. Only the original requester (or the
+operator) may cancel.
 
 ### execute_approved_action
+**Phase 2: invokes ExecutionGateway → KIS API.** Required: `approval_id`
+(must be in APPROVED state), `actor` (your role id; need not match the
+original requester, but typically does for audit clarity).
+
+Returns a structured result with:
+- `success` (bool)
+- `state` (terminal state after the call)
+- `broker_order_id` (KIS-assigned id, if accepted)
+- `filled_quantity` / `average_price`
+- `error_message` (on failure)
+- `executed_at_utc` / `elapsed_ms`
+
+If the call is **idempotent** (re-execute on EXECUTED or EXEC_FAILED
+record), the cached result is returned — no second KIS call.
+
+## Error response shape
+
+All tools return either:
+```json
+{"ok": true, "result": {...}}
 ```
-approval_id: str
-executed_by: str
-```
-Runs the approved action. Stub returns `{"executed": true, "stub": true, "note": "..."}` until Task 40.
-
-## Standard Pattern
-
-```
-# 1. Request
-res = request_submit_order(symbol="005930", side="buy", qty=10, requested_by="market_agent")
-aid = res["approval_id"]
-# tell operator: "I've requested approval (id={aid}), please review."
-
-# 2. Operator decides via CLI (out-of-band)
-
-# 3. Poll status
-res = get_approval_status(approval_id=aid)
-if res["status"] == "approved":
-    # 4. Execute
-    res = execute_approved_action(approval_id=aid, executed_by="market_agent")
-elif res["status"] == "rejected":
-    # explain to operator why it was rejected
-elif res["status"] == "expired":
-    # request again with current data
+or:
+```json
+{"ok": false, "error_kind": "handler|approval_store|gateway|internal",
+ "message": "human-readable description"}
 ```
 
-## Don'ts
+Never assume success — always check `ok`.
 
-- Don't request with `mode="live"` unless explicitly told the server allows it.
-- Don't repeatedly resubmit on rejection — explain to operator first.
-- Don't try to approve your own request — the store will refuse.
-- Don't store `approval_id` outside the conversation; fetch fresh status each time.
+## Forbidden behaviours
+
+- DO NOT include any secret values (API keys, passwords, account numbers
+  beyond the masked form already in the system) in any tool argument.
+- DO NOT attempt to bypass the approval workflow by calling internal
+  handlers — they are not MCP-exposed.
+- DO NOT create approvals on behalf of other agents using their
+  `requested_by` id. Always use your own role id.

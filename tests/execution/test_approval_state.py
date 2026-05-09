@@ -11,7 +11,6 @@ import pytest
 _REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO))
 
-from src.execution._approval_state import (
     ALLOWED_TRANSITIONS,
     DEFAULT_EXPIRY_SEC,
     MAX_PAYLOAD_BYTES,

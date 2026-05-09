@@ -1,0 +1,19 @@
+# JCPR-TS-V01 Integration Test Dependencies
+# Stage 2B Deliverable 1
+#
+# Install with:
+#   pip install -r requirements-test.txt
+#
+# NOTE: KIS official Python SDK is assumed to be already installed in the
+# environment (per Stage 2B specification). It is intentionally not pinned
+# here to avoid coupling test deps to a specific SDK release.
+
+pytest>=7.4,<9.0
+pytest-asyncio>=0.23,<1.0
+pytest-timeout>=2.2,<3.0
+
+# Property-based assertions for ledger / P&L invariants
+hypothesis>=6.92,<7.0
+
+# Used by conftest for deterministic time control in async tests
+freezegun>=1.4,<2.0
