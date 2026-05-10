@@ -69,3 +69,22 @@ audit/
 .venv/
 
 data/approvals.sqlite*
+
+# CRITICAL: capacity.local.yaml contains operator's actual capital info
+configs/capacity.local.yaml
+configs/capacity.*.local.yaml
+
+# Phase 2 A2-2: session history JSONL (P&L transaction history)
+data/audit/
+data/audit/*.jsonl
+
+# Other private data
+data/*.sqlite
+data/*.sqlite-journal
+data/*.sqlite-wal
+data/*.sqlite-shm
+data/*.db
+
+# pytest / OS
+.pytest_cache/
+.DS_Store
