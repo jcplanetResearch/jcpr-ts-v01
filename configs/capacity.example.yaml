@@ -93,6 +93,17 @@ capital_caps:
     floor_amount: 500000                   # 비중과 별개로 보장되는 절대 최소 현금
     note: "현금 보유가 둘 중 더 큰 값 아래로 떨어지면 신규 매수 차단."
 
+  # 4.6 Capacity ladder (Phase 2 A2-1) — capacity_advisor 자동 권장 입력
+  ladder:
+    - 1000000                              # step 0 (floor)
+    - 2000000                              # step 1
+    - 5000000                              # step 2
+    - 10000000                             # step 3
+    - 20000000                             # step 4 (top)
+  ladder_unit: KRW                         # 현재 KRW 만 지원
+  # 4.7 Current cash (Phase 2 sidebar automation, 선택)
+  current_cash_krw: 8000000                # 예시: 800만 원 (사이드바 cash_krw 자동 채움)
+
 # ============================================================
 # 5. 비율 한도 (Percentage Caps)
 # ============================================================

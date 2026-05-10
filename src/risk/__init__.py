@@ -22,6 +22,12 @@ from .portfolio_risk import (
     ProjectedImpact,
     quick_analyze,
 )
+# 기존 import 블록 끝에 추가:
+from .capacity_advisor import (
+    ALGORITHM_ID, DEFAULT_CONSECUTIVE_LOSS_THRESHOLD, DEFAULT_FLAT_THRESHOLD_RATIO,
+    CapacityAdvisor, CapacityAdvisorError, CapacityRecommendation,
+    HistoryStats, InvalidLadderError, SessionSignals,
+)
 
 __all__ = [
     # 분석기
@@ -36,6 +42,11 @@ __all__ = [
     "SEVERITY_CRITICAL",
     "UNKNOWN_SECTOR",
     "ETF_SECTOR",
+    # 추가
+    "CapacityAdvisor", "CapacityRecommendation", "SessionSignals",
+    "HistoryStats", "InvalidLadderError", "CapacityAdvisorError",
+    "ALGORITHM_ID", "DEFAULT_FLAT_THRESHOLD_RATIO",
+    "DEFAULT_CONSECUTIVE_LOSS_THRESHOLD",
 ]
 
 __version__ = "0.2.0"

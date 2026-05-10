@@ -39,6 +39,80 @@ from src.dashboard.views import (  # noqa: E402
     render_risk_view,
     render_system_view,
 )
+# B-full additions (옵션 B-full):
+#   B1: layer 13-17 보안 게이트 호출
+#   B5: capacity.local.yaml 자동 default 로드
+from src.dashboard._security import (  # noqa: E402
+    DashboardSecurityError,
+    assert_audit_logs_secured,
+    assert_no_secrets_in_env,
+    enforce_localhost_binding,
+    verify_db_permissions,
+)
+from src.dashboard.views._phase1_bridge import (  # noqa: E402
+    try_load_capacity_default,
+)
+from src.dashboard._sidebar_defaults import resolve_sidebar_defaults
+
+# ─────────────────────────────────────────────────
+# A1 (옵션 Y): 데이터 소스 권한 검증 헬퍼
+# ─────────────────────────────────────────────────
+
+def _verify_data_source_permissions(
+    data_source: DashboardDataSource,
+) -> list[tuple[str, str]]:
+    """모든 입력 경로의 권한 검증; 위반 사항 리스트 반환.
+
+    DB(layer 15) + audit log(layer 17) 모두 검사. 위반 사항은 raise
+    하지 않고 리스트로 반환 → 호출자가 사이드바에 일괄 표시. 데이터
+    로드는 graceful 동작 (`_safe_query`가 권한 위반 시 빈 DataFrame).
+
+    Returns:
+        list of (label, error_message) tuples. Empty list = all OK.
+    """
+    issues: list[tuple[str, str]] = []
+
+    # DB 경로들 (layer 15)
+    db_paths = [
+        ("Positions DB", data_source.positions_db),
+        ("OHLCV DB", data_source.ohlcv_db),
+        ("Quote DB", data_source.quote_db),
+    ]
+    for label, raw in db_paths:
+        if not raw:
+            continue
+        try:
+            verify_db_permissions(Path(raw))
+        except DashboardSecurityError as exc:
+            issues.append((label, str(exc)))
+
+    # Audit 로그들 (layer 17) — 일괄 검사
+    audit_paths: list[Path] = []
+    audit_label_map: dict[str, str] = {}
+    for label, raw in [
+        ("Risk Audit", data_source.risk_audit_path),
+        ("Execution Audit", data_source.execution_audit_path),
+        ("Reconciliation Audit", data_source.reconciliation_audit_path),
+    ]:
+        if raw:
+            p = Path(raw)
+            audit_paths.append(p)
+            audit_label_map[str(p)] = label
+    if audit_paths:
+        try:
+            assert_audit_logs_secured(audit_paths)
+        except DashboardSecurityError as exc:
+            # assert_audit_logs_secured raises on first violation; we
+            # extract the offending path from the message and tag it.
+            msg = str(exc)
+            tagged_label = "Audit Logs"
+            for path_str, label in audit_label_map.items():
+                if path_str in msg:
+                    tagged_label = label
+                    break
+            issues.append((tagged_label, msg))
+
+    return issues
 
 
 # ─────────────────────────────────────────────────
@@ -59,6 +133,9 @@ st.set_page_config(
 
 def _render_sidebar() -> tuple[DashboardDataSource, float, float, str | None]:
     """사이드바 렌더링 + 설정 반환."""
+    # Phase 2 — Sidebar Automation: 3-tier fallback chain default
+    defaults = resolve_sidebar_defaults()
+
     st.sidebar.title("⚙️ 설정 (Settings)")
     st.sidebar.caption("JCPR Trading System v0.1.1")
 
@@ -67,63 +144,87 @@ def _render_sidebar() -> tuple[DashboardDataSource, float, float, str | None]:
 
     positions_db = st.sidebar.text_input(
         "Positions DB",
-        value=os.environ.get("JCPR_POSITIONS_DB", ""),
-        help="포지션·체결·주문 DB 경로 (Task 23-25)",
+        value=defaults.positions_db,
+    	help=f"auto-loaded from: {defaults.sources['positions_db']}",
     )
     ohlcv_db = st.sidebar.text_input(
         "OHLCV DB",
-        value=os.environ.get("JCPR_OHLCV_DB", ""),
-        help="OHLCV 가격 DB 경로 (Task 12)",
+        value=defaults.ohlcv_db,
+    	help=f"auto-loaded from: {defaults.sources['ohlcv_db']}",
     )
     quote_db = st.sidebar.text_input(
         "Quote DB",
-        value=os.environ.get("JCPR_QUOTE_DB", ""),
-        help="실시간 호가 DB 경로 (Task 13)",
+        value=defaults.quote_db,
+    	help=f"auto-loaded from: {defaults.sources['quote_db']}",
     )
     risk_audit_path = st.sidebar.text_input(
         "Risk Audit Log (.jsonl)",
-        value=os.environ.get("JCPR_RISK_AUDIT", ""),
-        help="리스크 게이트 감사 로그 (Task 19)",
+        value=defaults.risk_audit_path,
+    	help=f"auto-loaded from: {defaults.sources['risk_audit_path']}",
     )
     execution_audit_path = st.sidebar.text_input(
         "Execution Audit Log (.jsonl)",
-        value=os.environ.get("JCPR_EXEC_AUDIT", ""),
-        help="실행 게이트웨이 감사 로그 (Task 21)",
+        value=defaults.execution_audit_path,
+    	help=f"auto-loaded from: {defaults.sources['execution_audit_path']}",
+    )
+    # A3 (옵션 Y): Reconciler가 작성한 jsonl 경로. 별도 프로세스가
+    # KIS API와 통신하여 결과를 여기에 append → dashboard는 read-only.
+    reconciliation_audit_path = st.sidebar.text_input(
+        "Reconciliation Audit (.jsonl)",
+        value=defaults.reconciliation_audit_path,
+    	help=f"auto-loaded from: {defaults.sources['reconciliation_audit_path']}",
     )
     rejection_report_path = st.sidebar.text_input(
         "Rejection Report (선택)",
-        value=os.environ.get("JCPR_REJECTION_REPORT", ""),
-        help="Task 20 거부 분석 리포트",
+        value=defaults.rejection_report_path,
+    	help=f"auto-loaded from: {defaults.sources['rejection_report_path']}",
     )
     kill_switch_file = st.sidebar.text_input(
         "Kill Switch File",
-        value=os.environ.get("JCPR_KILL_SWITCH", "runtime/KILL_SWITCH_ON"),
-        help="Task 31 kill switch 감시 파일",
+        value=defaults.kill_switch_file,
+    	help=f"auto-loaded from: {defaults.sources['kill_switch_file']}",
     )
     capacity_config = st.sidebar.text_input(
         "Capacity Config",
-        value=os.environ.get("JCPR_CAPACITY_CONFIG", "configs/capacity.yaml"),
-        help="capacity.yaml 경로 (Task 5)",
+        value=defaults.capacity_config,
+    	help=f"auto-loaded from: {defaults.sources['capacity_config']}",
     )
 
     st.sidebar.divider()
+
+    # B5 (옵션 B-full): capacity.local.yaml 자동 default 로드
+    # 운영자가 명시적으로 다른 값을 입력하면 그것이 우선 — 본 자동 로드는
+    # default suggestion만 제공.
+    capacity_loaded = try_load_capacity_default(capacity_config)
+    if capacity_loaded is not None:
+        st.sidebar.caption(
+            f"✅ capacity 로드됨 (loaded): "
+            f"profile=`{capacity_loaded['profile_name']}`, "
+            f"mode=`{capacity_loaded['operating_mode']}`"
+        )
+        default_starting = capacity_loaded["starting_capital_krw"]
+    else:
+        default_starting = float(os.environ.get("JCPR_STARTING_CAPITAL", "10000000"))
 
     # 세션 정보
     st.sidebar.subheader("💰 세션 정보 (Session)")
     starting_capital_krw = st.sidebar.number_input(
         "시작 자본 (Starting Capital, KRW)",
         min_value=0.0,
-        value=float(os.environ.get("JCPR_STARTING_CAPITAL", "10000000")),
+        value=defaults.starting_capital_krw,
+    	help=f"auto-loaded from: {defaults.sources['starting_capital_krw']}",
         step=1_000_000.0,
         format="%.0f",
     )
     cash_krw = st.sidebar.number_input(
         "현금 잔고 (Cash Balance, KRW)",
         min_value=0.0,
-        value=float(os.environ.get("JCPR_CASH", "10000000")),
+        # value=float(os.environ.get("JCPR_CASH", "10000000")),
+	value=defaults.cash_krw,
+    	help=f"auto-loaded from: {defaults.sources['cash_krw']}",
         step=100_000.0,
         format="%.0f",
-        help="브로커 API에서 자동 갱신될 예정",
+        # help="브로커 API에서 자동 갱신될 예정",
     )
 
     st.sidebar.divider()
@@ -170,6 +271,7 @@ def _render_sidebar() -> tuple[DashboardDataSource, float, float, str | None]:
         rejection_report_path=rejection_report_path or None,
         kill_switch_file=kill_switch_file or None,
         capacity_config=capacity_config or None,
+        reconciliation_audit_path=reconciliation_audit_path or None,  # A3
     )
     return ds, starting_capital_krw, cash_krw, since_iso
 
@@ -186,7 +288,51 @@ def main() -> None:
         "| 로컬 전용 (Local Only)"
     )
 
+    # B1 (옵션 B-full): 보안 게이트 layer 13-17 호출.
+    # st.stop()은 이후 모든 컨텐츠 렌더를 차단하므로, 위반 시 운영자는
+    # 명시적 에러만 보고 데이터에 접근하지 못함 (fail-closed).
+    try:
+        assert_no_secrets_in_env()
+        # Streamlit이 이미 시작되어 있으므로 사후 검증; 잘못된 바인딩이면
+        # 화면에 명시적으로 표시하고 컨텐츠 렌더 차단.
+        enforce_localhost_binding(
+            os.environ.get("STREAMLIT_SERVER_ADDRESS"),
+        )
+    except DashboardSecurityError as exc:
+        st.error(f"🛑 보안 검증 실패 (Security check failed): {exc}")
+        st.caption(
+            "대시보드를 안전하게 시작하려면:\n"
+            "1. `streamlit run ... --server.address=127.0.0.1` 으로 실행 "
+            "(또는 환경변수 `STREAMLIT_SERVER_ADDRESS=127.0.0.1`)\n"
+            "2. 셸에 `PASSWORD=`, `TOKEN=`, `API_KEY=` 같은 raw 시크릿 "
+            "env var이 없어야 함\n"
+            "3. 시크릿은 반드시 `.env` 파일을 통해 로드 (직접 export 금지)"
+        )
+        st.stop()  # 이후 컨텐츠 렌더 차단 (fail-closed)
+
     data_source, starting_capital, cash, since_iso = _render_sidebar()
+
+    # A1 (옵션 Y): layer 15 (DB) + layer 17 (audit) 권한 일괄 검증.
+    # 위반 시 raise 안 함 — 화면에 경고만 표시하고 `_safe_query`가 빈
+    # DataFrame을 반환하여 graceful 처리. 운영자는 `chmod 600 <path>`로
+    # 즉시 복구 가능.
+    perm_issues = _verify_data_source_permissions(data_source)
+    if perm_issues:
+        st.warning(
+            "⚠️ **데이터 소스 권한 위반 (Permission violations detected)** — "
+            "0600(rw-------)이 아닌 파일이 있습니다. "
+            "권한 위반 파일은 데이터 로드가 차단됩니다 (fail-closed)."
+        )
+        for label, msg in perm_issues:
+            st.error(f"**{label}**: {msg}")
+        st.code(
+            "# 모든 데이터 파일을 0600으로 보호:\n"
+            "chmod 600 data/approvals.sqlite\n"
+            "chmod 600 data/audit/*.jsonl\n"
+            "# 새로고침: 사이드바 🔄 새로고침 또는 페이지 reload",
+            language="bash",
+        )
+        st.divider()
 
     # 5개 탭
     tabs = st.tabs([

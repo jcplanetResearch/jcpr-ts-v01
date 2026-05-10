@@ -46,6 +46,9 @@ class DashboardDataSource:
         rejection_report_path: 최신 거부 분석 리포트 (Task 20)
         kill_switch_file: kill switch 파일 (Task 31)
         capacity_config: capacity.yaml 경로 (Task 5)
+        reconciliation_audit_path: Reconciler 감사 로그 (Task 28, JSONL).
+            A3 (옵션 Y): 별도 reconciler 프로세스가 작성한 jsonl을
+            read-only로 읽음. 시크릿은 dashboard 외부에 격리됨.
     """
     positions_db: Optional[str] = None
     ohlcv_db: Optional[str] = None
@@ -55,6 +58,7 @@ class DashboardDataSource:
     rejection_report_path: Optional[str] = None
     kill_switch_file: Optional[str] = None
     capacity_config: Optional[str] = None
+    reconciliation_audit_path: Optional[str] = None  # A3: 신규 필드
 
 
 # ─────────────────────────────────────────────────
@@ -66,9 +70,29 @@ def _safe_query(db_path: str, query: str, params: tuple = ()) -> pd.DataFrame:
     SQLite 안전 쿼리 — 파일 없거나 테이블 없으면 빈 DataFrame.
 
     (Safe SQLite query — returns empty DataFrame if file/table missing.)
+
+    A1 (옵션 Y): layer 15 권한 검증을 sqlite3 연결 직전에 호출.
+    위반 시 (0644 등) 빈 DataFrame 반환 — fail-closed. 사이드바에서
+    이미 운영자에게 경고가 표시되므로 추가 안내 불필요.
     """
     if not db_path or not Path(db_path).exists():
         return pd.DataFrame()
+
+    # A1: layer 15 권한 검증 (verify_db_permissions은 graceful — file
+    # absent / non-POSIX 환경에서는 통과). DashboardSecurityError가
+    # raise되면 권한 위반이므로 빈 DataFrame 반환.
+    try:
+        from src.dashboard._security import (
+            verify_db_permissions,
+            DashboardSecurityError,
+        )
+        verify_db_permissions(Path(db_path))
+    except DashboardSecurityError:
+        return pd.DataFrame()
+    except ImportError:  # pragma: no cover — defensive
+        # _security 모듈 부재 시 graceful — 검증 없이 통과
+        pass
+
     try:
         with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
             return pd.read_sql_query(query, conn, params=params)

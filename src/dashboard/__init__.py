@@ -1,43 +1,30 @@
+"""JCPR Trading System — Dashboard (Task 48).
+
+User-monitoring dashboard for the JCPR (single-operator, local-only)
+trading system. Reads from already-implemented modules:
+
+    Task 19 — risk_gate.py
+    Task 25 — position_ledger.py
+    Task 26 — pnl_engine.py
+    Task 27 — slippage.py
+    Task 28 — reconciliation.py
+
+and from ApprovalStore (sessions 1-15 of Stage 2-B).
+
+Security model:
+    - Bound to 127.0.0.1 only (single-operator, single host)
+    - 0600 enforcement on all opened DB files
+    - Read-only data adapters (no UPDATE/INSERT from this package)
+    - Secret scrubbing on any rendered text
+    - capacity.local.yaml is the single source of starting_capital_krw
+      (gitignored, never committed)
+
+This file marks the package; submodules expose the public API:
+    _security  — layers 13-17 of the cumulative defense stack
+    _config    — DashboardConfig + CapacityConfig (capacity.yaml parser)
+    _data      — read-only adapters for each Task module
+    _audit_reader — JSONL tail/since/aggregate readers
+    _formatters — Decimal/datetime/mode display helpers
 """
-대시보드 패키지 (Dashboard Package)
-====================================
 
-JCPR Trading System - jcpr-ts-v01
-Task 48 v0.1.1
-
-Streamlit 기반 실시간 모니터링 대시보드.
-(Streamlit-based real-time monitoring dashboard.)
-
-실행 (Run):
-    streamlit run src/dashboard/app.py --server.address=127.0.0.1
-    또는 (or):
-    bash scripts/run_dashboard.sh
-
-설계 원칙 (Design Principles):
-    - 로컬 전용 (localhost only) — 외부 노출 금지
-    - 시크릿 절대 표시 안 함 (never display secrets)
-    - 읽기 전용 (read-only) — 거래 실행 기능 없음
-    - 캐싱으로 DB 부하 최소화 (cache to reduce DB load)
-"""
-
-from .data_loader import (
-    DashboardDataSource,
-    load_audit_summary,
-    load_fills,
-    load_market_status,
-    load_pnl_snapshot,
-    load_positions,
-    load_rejection_summary,
-)
-
-__all__ = [
-    "DashboardDataSource",
-    "load_audit_summary",
-    "load_fills",
-    "load_market_status",
-    "load_pnl_snapshot",
-    "load_positions",
-    "load_rejection_summary",
-]
-
-__version__ = "0.1.1"
+__version__ = "0.1.0"  # Phase 2-B Task 48
